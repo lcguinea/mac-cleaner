@@ -3,7 +3,8 @@
 Alternativa propia a las funciones de limpieza de CleanMyMac, basada en la investigación REA-004
 (informe y evidencias locales, no versionados: contienen metadatos de binarios propietarios y datos del equipo).
 
-**Estado: F3, auditada en F3.5** (14-11-2026): preparación para la limpieza real, que **sigue deshabilitada**. F2.5 (auditoría) en
+**Estado: F4A** (14-11-2026): lista blanca integrada en `plan` y `apply` y observación en sombra de 7 días en curso;
+la limpieza real **sigue deshabilitada** (F4B no habilitada; procedimiento en `docs/F4.md`). F2.5 (auditoría) en
 `docs/SEGURIDAD-F2.md` §8; F3 (HMAC, lista blanca npm/pip, modo sombra) y F3.5 (Llavero, recuperación manual) en `docs/SEGURIDAD-F3.md`.
 - F1 (`scan`, `report`) es de solo lectura y funciona sobre el Mac real.
 - F3 (`sombra`, `clave`) firma planes y manifiestos con HMAC-SHA256 (clave en el Llavero), define una lista blanca
@@ -35,6 +36,16 @@ Alternativa propia a las funciones de limpieza de CleanMyMac, basada en la inves
 ./mac-cleaner purge --zona ZONA [--dias 14] [--ejecutar]   # sin --ejecutar solo lista
 ./mac-cleaner oficiales                                # brew, npm y pip: reversibles frente a destructivas
 ```
+
+### F4A (lista blanca obligatoria y observación; nada real se mueve)
+
+```bash
+./mac-cleaner sombra --observacion         # una vez al día durante 7 días, a mano (docs/F4.md §3)
+./mac-cleaner observacion                  # resumen de los días observados y criterios objetivos para F4B
+```
+
+`plan` y `apply` solo admiten la lista blanca OFICIAL (npm `_cacache`, pip `http-v2`/`http`): ni el TOML, ni la CLI, ni
+el plan pueden ampliarla, y `apply` la revalida inmediatamente antes de cada movimiento.
 
 ### F3 (preparación; nada real se mueve)
 
@@ -127,13 +138,21 @@ Para cada grupo (primer componente bajo la raíz) el informe da:
 ## Pruebas
 
 ```bash
-/opt/homebrew/bin/python3 -B -m unittest discover -s tests -v    # 111 pruebas (1 opcional), ~10 s
+/opt/homebrew/bin/python3 -B -m unittest discover -s tests -v    # 130 pruebas (1 opcional), ~10 s
 MAC_CLEANER_PRUEBA_LLAVERO_TEMPORAL=1 …   # incluye la prueba con un Llavero temporal (sin diálogos)
 ```
 
-Son 111 pruebas: 16 de F1 (`tests/test_escaner.py`), 31 de F2 (`tests/test_f2.py`), 20 de la auditoría F2.5
-(`tests/test_f25.py`), 25 de F3 (`tests/test_f3.py`) y 19 de la auditoría F3.5 (`tests/test_f35.py`; una es
-opcional). Ninguna toca el Llavero real: usan claves sintéticas en memoria o, la opcional, un Llavero temporal.
+Son 130 pruebas: 16 de F1 (`tests/test_escaner.py`), 31 de F2 (`tests/test_f2.py`), 20 de la auditoría F2.5
+(`tests/test_f25.py`), 25 de F3 (`tests/test_f3.py`), 19 de la auditoría F3.5 (`tests/test_f35.py`; una es
+opcional) y 19 de F4A (`tests/test_f4a.py`). Las pruebas de mecánica genérica de F2 a F3.5 usan una lista blanca de
+laboratorio (solo desde código, en zonas sintéticas); las de F4A y las de CLI, la OFICIAL.
+
+**F4A** cubre: plan con solo npm `_cacache` y pip `http`/`http-v2`, apply y restore con la lista oficial, planes
+forjados con rutas no permitidas (`_logs`, `wheels`, `~/Library/Caches`, `node_modules` en la caché, `_npx`, MCP), TOML
+que intenta ampliar la lista, plan que declara otra lista, configuración cambiada, subárbol sustituido por un enlace,
+revalidación inmediatamente antes de mover, ficheros abiertos o modificados, plan real por la CLI, sombra con
+`--observacion` que solo escribe en `informes/`, `demo` con la lista oficial, informes reproducibles y el resumen de
+observación. Ninguna toca el Llavero real: usan claves sintéticas en memoria o, la opcional, un Llavero temporal.
 
 **F3.5** cubre: manifiestos con la última línea incompleta, final truncado y sin cierre, registros eliminados o
 reordenados, firmas inválidas, recuperación sin clave en dos pasos (rutas manipuladas, conflictos, sustitución tras el
@@ -177,13 +196,14 @@ maccleaner/guardia.py    guardia de solo lectura en tiempo de ejecución
 maccleaner/herramientas.py  localización no destructiva de las cachés de brew, pip y npm
 maccleaner/sistema.py    prioridad baja, lsof, disco, snapshots
 maccleaner/informe.py    JSON → Markdown
-maccleaner/cli.py        órdenes scan, report, plan, apply, restore, purge, oficiales, demo, sombra, clave
+maccleaner/cli.py        órdenes scan, report, plan, apply, restore, purge, oficiales, demo, sombra, observacion, clave
 maccleaner/zona.py       puerta de zona sintética (LIMPIEZA_REAL_HABILITADA = False)
 maccleaner/fsseguro.py   openat con O_NOFOLLOW, renameatx_np(RENAME_EXCL), SHA-256 por descriptor
 maccleaner/manifiesto.py manifiesto JSON Lines encadenado con fsync, flock, O_NOFOLLOW y MAC por registro
 maccleaner/autenticacion.py  HMAC-SHA256 de planes y manifiestos; clave en el Llavero (ctypes) o sintética
 maccleaner/listablanca.py    lista blanca inicial para limpieza real (npm _cacache, pip http-v2/http)
-maccleaner/sombra.py         ejecución en sombra: candidatos, exclusiones, riesgos, cambios, autorizaciones
+maccleaner/sombra.py         ejecución en sombra con los criterios del motor real (lista blanca oficial)
+maccleaner/observacion.py    registro y resumen de la observación de 7 días
 maccleaner/plan.py       creación y validación de planes
 maccleaner/aplicar.py    apply (cuarentena)
 maccleaner/restaurar.py  restore
@@ -193,4 +213,5 @@ tests/                   pruebas focalizadas (unittest)
 informes/                resultados de los escaneos (local, no versionado)
 docs/SEGURIDAD-F2.md     modelo de amenazas, metadatos, limitaciones, auditoría F2.5 y plan de habilitación real
 docs/SEGURIDAD-F3.md     autenticación, claves, lista blanca, sombra, riesgos y procedimiento de autorización
+docs/F4.md               lista blanca integrada, informe de sombra, observación de 7 días y procedimiento F4B
 ```

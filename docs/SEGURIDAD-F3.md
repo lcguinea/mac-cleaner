@@ -144,7 +144,7 @@ Definida en el código (`listablanca.LISTA_BLANCA`), no en el TOML, para que la 
 - **Protecciones de F1**: siguen delante de todo. Los perfiles y datos de Claude, Codex, Gemini, Argos, REA y AEON, los proyectos, los entornos, las credenciales, la música, los renders y los modelos no llegan a ser candidatos.
 - **Sin órdenes oficiales**: no se usa ninguna orden oficial que borre (`npm cache clean`, `npm cache verify`, `pip cache purge`). La operación prevista es mover a cuarentena, que es reversible.
 
-Hoy la lista blanca **solo clasifica**: `apply` no puede operar sobre datos reales. Conectarla a `apply` es parte del procedimiento de §8.
+**F4A**: la lista blanca está integrada y es obligatoria en `plan` y `apply` (revalidada inmediatamente antes de cada movimiento) y en `sombra`; ver `docs/F4.md`. `apply` sigue sin poder operar sobre datos reales.
 
 ## 6. Modo sombra
 
@@ -188,6 +188,9 @@ Hoy la lista blanca **solo clasifica**: `apply` no puede operar sobre datos real
 - **Heredados de F2.5**: los riesgos de `docs/SEGURIDAD-F2.md` §6 y §8.3 siguen vigentes, salvo la falta de autenticación, que F3 resuelve.
 
 ## 8. Procedimiento de autorización futura (F4) y criterios para la primera limpieza supervisada
+
+**Actualizado en F4A**: el procedimiento vigente (observación de 7 días, autorización, topes, restauración de prueba y
+condiciones de aborto) está en `docs/F4.md` §3–§4. Lo que sigue es el esquema original de F3.
 
 Ningún paso está hecho. Cada uno requiere una decisión expresa del usuario.
 

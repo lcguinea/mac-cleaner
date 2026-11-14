@@ -24,6 +24,12 @@ manifiesto bloqueado (flock): un restore o purge simultáneo de la misma operaci
 F3: el plan debe tener un MAC HMAC-SHA256 válido; el manifiesto se firma con la misma clave. Antes de mover
 nada se RESERVA el id del plan en `<cuarentena>/planes-aplicados/<id>` (creación exclusiva O_EXCL): un plan
 solo se puede aplicar una vez, aunque se borre su operación o se ejecuten dos apply a la vez.
+
+F4A: lista blanca OBLIGATORIA. Al empezar se recalculan sus subárboles con la configuración verificada y las cachés
+de las herramientas (en zona sintética, las ficticias de la zona); por elemento, la clasificación se comprueba al
+principio y otra vez inmediatamente antes del movimiento, junto con la raíz de la caché (sin marcadores de proyecto
+o entorno y sin enlaces). Lo que no está en la lista blanca se omite. Solo código Python puede pasar otra lista
+(`lista_blanca=`): la CLI no tiene esa opción y el plan no la decide.
 Un elemento que no supera una comprobación se OMITE (con motivo) y se sigue con el siguiente. Un error del
 sistema al mover ABORTA el resto: lo ya movido queda registrado y es restaurable.
 """
@@ -36,7 +42,7 @@ import secrets
 import stat
 import time
 
-from . import autenticacion as aut, fsseguro, zona as zona_mod
+from . import autenticacion as aut, fsseguro, listablanca, zona as zona_mod
 from .config import cargar as cargar_config
 from .escaner import DIA, ref_antiguedad, riesgo_de
 from .guards import bajo, expandir
@@ -53,7 +59,8 @@ def directorio_cuarentena(zona: str) -> str:
 
 
 class Aplicador:
-    def __init__(self, plan: dict, *, ahora: float | None = None, abiertos: FicherosAbiertos | None = None):
+    def __init__(self, plan: dict, *, ahora: float | None = None, abiertos: FicherosAbiertos | None = None,
+                 lista_blanca: "listablanca.ListaBlanca | None" = None):
         self.plan = plan
         self.ahora = ahora or time.time()
         self.zona = validar_plan(plan, self.ahora)
@@ -66,8 +73,15 @@ class Aplicador:
         self.cfg = cargar_config(plan["config"], home=plan["home"], tmpdir=plan["tmpdir"])
         self.prot = self.cfg.proteccion
         self.reglas = {r.id: r for r in self.cfg.reglas}
+        self.herramientas = zona_mod.herramientas_de_zona(self.zona)
         self._raices_regla = {r.id: [os.path.realpath(expandir(x, self.cfg.home, self.cfg.tmpdir)) for x in r.rutas]
                               for r in self.cfg.reglas if r.tipo == "ruta"}
+        for r in self.cfg.reglas:
+            info = self.herramientas.get(r.herramienta or "") or {}
+            if r.tipo == "herramienta" and info.get("disponible"):
+                self._raices_regla[r.id] = [os.path.realpath(info["ruta"])]
+        self.lista_blanca = lista_blanca or listablanca.OFICIAL
+        self.subarboles, self.rechazos_lista_blanca = self.lista_blanca.subarboles(self.cfg, self.herramientas)
         self.abiertos = abiertos if abiertos is not None else FicherosAbiertos.capturar()
         self.uid = os.getuid()
         self._renombrar = fsseguro.mover_excl       # punto de inyección para las pruebas de fallos
@@ -111,8 +125,8 @@ class Aplicador:
         regla = self.reglas.get(e["regla"])
         if regla is None:
             return None, f"la regla del plan «{e['regla']}» no existe en la configuración"
-        if regla.tipo != "ruta":
-            return None, f"la regla «{regla.id}» es de herramienta: no admitida en zona sintética"
+        if regla.id not in self._raices_regla:
+            return None, f"la regla «{regla.id}» no tiene raíz disponible (herramienta no disponible)"
         ruta = e["ruta"]
         raiz = next((r for r in self._raices_regla[regla.id] if bajo(ruta, r) and ruta != r), None)
         if raiz is None:
@@ -169,7 +183,8 @@ class Aplicador:
         man = Manifiesto.crear(os.path.join(qop, "manifiesto.jsonl"), clave=self.clave, op=op, plan_id=self.plan["id"],
                                plan_huella=self.plan["huella"], zona=self.zona, cuarentena=qop,
                                n_elementos=len(self.plan["elementos"]), ahora=self.ahora,
-                               lsof={"disponible": self.abiertos.disponible, "n": len(self.abiertos)})
+                               lsof={"disponible": self.abiertos.disponible, "n": len(self.abiertos)},
+                               lista_blanca={"nombre": self.lista_blanca.nombre, "subarboles": self.subarboles})
         res = {"op": op, "cuarentena": qop, "manifiesto": man.ruta, "movidos": 0, "omitidos": 0, "errores": 0,
                "bytes_movidos": 0, "abortado": None}
         with man.bloquear():
@@ -204,6 +219,11 @@ class Aplicador:
                     man.anotar("omitido", id=e["id"], motivo=motivo)
                     res["omitidos"] += 1
                     continue
+                ok_lb, motivo_lb = self.lista_blanca.clasificar(e["regla"], e["ruta"], self.subarboles)
+                if not ok_lb:
+                    man.anotar("omitido", id=e["id"], motivo=f"fuera de la lista blanca: {motivo_lb}")
+                    res["omitidos"] += 1
+                    continue
                 try:
                     pfd = fsseguro.abrir_dir(self.zona, rel_dir)
                 except OSError as exc:
@@ -215,6 +235,12 @@ class Aplicador:
                     st, motivo = self._verificar(e, pfd, nombre, edad_dias)
                     if motivo:
                         man.anotar("omitido", id=e["id"], motivo=motivo)
+                        res["omitidos"] += 1
+                        continue
+                    # Revalidación de la lista blanca INMEDIATAMENTE antes del movimiento.
+                    motivo_lb = self.lista_blanca.raiz_sigue_aceptable(e["ruta"], self.subarboles, e["regla"], self.cfg.home)
+                    if motivo_lb:
+                        man.anotar("omitido", id=e["id"], motivo=f"lista blanca revalidada: {motivo_lb}")
                         res["omitidos"] += 1
                         continue
                     try:

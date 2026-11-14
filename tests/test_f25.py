@@ -28,7 +28,7 @@ from maccleaner.purgar import purgar  # noqa: E402
 from maccleaner.restaurar import restaurar  # noqa: E402
 
 from maccleaner import autenticacion as aut  # noqa: E402
-from test_f2 import DIA, ENV_CLI, HEX_SINTETICA, PROYECTO, Caida, ZonaBase, escribir, huella_fichero  # noqa: E402
+from test_f2 import DIA, ENV_CLI, HEX_SINTETICA, PROYECTO, Caida, ZonaBase, escribir, fixture_npm_pip, huella_fichero  # noqa: E402
 
 
 def elemento_forjado(ruta: str, eid: str, **extra) -> dict:
@@ -414,6 +414,7 @@ class TestCLIF25(ZonaBase):
                               env=ENV_CLI, timeout=120)
 
     def _plan_cli(self):
+        self.f = fixture_npm_pip(self)          # F4A: la CLI solo admite la lista blanca oficial (npm/pip)
         p = self.run_cli("scan", "--zona-sintetica", self.zona, "--config", self.cfg_ruta, "--sin-lsof")
         self.assertEqual(p.returncode, 0, p.stderr)
         p = self.run_cli("plan", "--entrada", p.stdout.split("JSON: ")[1].strip(), "--sin-lsof")

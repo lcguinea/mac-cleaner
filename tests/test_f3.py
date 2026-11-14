@@ -452,7 +452,7 @@ class ZonaHerramientas(ZonaBase):
         cfg = self.cfg()
         esc = ejecutar_scan(cfg, abiertos=VACIO, zona=self.zona, ahora=ahora or self.T0,
                             herramientas_fijas=herramientas_de_zona(self.zona))
-        return sombra.evaluar(esc, cfg, abiertos=VACIO, ahora=(ahora or self.T0) + 60, anterior=anterior)
+        return sombra.evaluar(esc, cfg, abiertos=VACIO, ahora=(ahora or self.T0) + 60, anterior=anterior)[0]
 
     def instantanea(self):
         out = {}
@@ -524,8 +524,8 @@ class TestListaBlancaYSombra(ZonaHerramientas):
         self.assertEqual(cam["npm:_cacache"]["delta_ficheros"], 1)
         self.assertEqual(c["delta_totales"]["lista_blanca_ficheros"], 0)
         md = sombra.markdown(d2)
-        for seccion in ("Candidatos por grupo", "Operaciones que requerirían autorización", "Exclusiones", "Riesgos",
-                        "Cambios respecto a la ejecución anterior"):
+        for seccion in ("Candidatos, riesgo y justificación", "Autorizaciones que serían necesarias", "Exclusiones",
+                        "Riesgos", "Cambios respecto a la ejecución anterior"):
             self.assertIn(seccion, md)
 
 

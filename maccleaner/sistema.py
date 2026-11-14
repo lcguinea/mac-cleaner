@@ -65,6 +65,13 @@ class FicherosAbiertos:
         i = bisect.bisect_left(self._rutas, ruta)
         return i < len(self._rutas) and self._rutas[i] == ruta
 
+    def contar_bajo(self, directorio: str) -> int:
+        pref = directorio.rstrip("/") + "/"
+        i = j = bisect.bisect_left(self._rutas, pref)
+        while j < len(self._rutas) and self._rutas[j].startswith(pref):
+            j += 1
+        return j - i
+
     def alguno_bajo(self, directorio: str) -> bool:
         pref = directorio.rstrip("/") + "/"
         i = bisect.bisect_left(self._rutas, pref)

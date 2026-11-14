@@ -34,13 +34,7 @@ def _salida(a: argparse.Namespace, zona: str | None) -> str:
     return os.path.join(zona, "informes") if zona else SALIDA_DEF
 
 
-def herramientas_de_zona(zona: str) -> dict:
-    """En una zona sintética las herramientas no se consultan: sus cachés son las ficticias de la zona."""
-    home = os.path.join(zona, "home")
-    return {"npm": {"herramienta": "npm", "disponible": True, "ruta": os.path.join(home, ".npm"), "origen": "zona sintética"},
-            "pip": {"herramienta": "pip", "disponible": True, "ruta": os.path.join(home, "Library", "Caches", "pip"),
-                    "origen": "zona sintética"},
-            "brew": {"herramienta": "brew", "disponible": False, "motivo": "zona sintética"}}
+herramientas_de_zona = zona_mod.herramientas_de_zona   # compatibilidad (F3)
 
 
 def ejecutar_scan(cfg, *, abiertos, brew_dry_run=False, solo_reglas=None, zona=None, ahora=None,
@@ -79,7 +73,8 @@ def cmd_scan(a: argparse.Namespace) -> int:
         print(f"Error de configuración: {exc}", file=sys.stderr)
         return 2
     abiertos = sistema.FicherosAbiertos.capturar() if (cfg.usar_lsof and not a.sin_lsof) else sistema.FicherosAbiertos()
-    datos = ejecutar_scan(cfg, abiertos=abiertos, brew_dry_run=a.brew_dry_run, solo_reglas=a.regla, zona=zona)
+    datos = ejecutar_scan(cfg, abiertos=abiertos, brew_dry_run=a.brew_dry_run, solo_reglas=a.regla, zona=zona,
+                          herramientas_fijas=zona_mod.herramientas_de_zona(zona) if zona else None)
     datos["guardia"] = {"activa": True, "permitido": a.salida,
                         "bloqueos": [x for x in guardia.registro if x.startswith("BLOQUEADO")],
                         "subprocesos": [x for x in guardia.registro if x.startswith("subprocess")]}
@@ -244,22 +239,26 @@ def cmd_demo(a: argparse.Namespace) -> int:
     if not os.environ.get(aut.ENV_SINTETICA):
         aut.establecer_almacen(aut.AlmacenSintetico.nuevo())   # demo: clave sintética efímera, nunca el Llavero
     guardia.activar(zona)
-    caches = os.path.join(zona, "home", "Library", "Caches")
+    home = os.path.join(zona, "home")
+    destinos = [os.path.join(home, ".npm", "_cacache", "content-v2", "sha512"),
+                os.path.join(home, "Library", "Caches", "pip", "http-v2")]
     for i in range(12):
-        d = os.path.join(caches, f"app{i % 3}")
+        d = os.path.join(destinos[i % 2], f"{i:02x}", f"{i * 7:02x}")
         os.makedirs(d, exist_ok=True)
-        with open(os.path.join(d, f"f{i}.cache"), "wb") as fh:
+        with open(os.path.join(d, f"f{i}"), "wb") as fh:
             fh.write(os.urandom(4096 * (i + 1)))
-    os.makedirs(os.path.join(caches, "proyecto", ".git"))
-    with open(os.path.join(caches, "proyecto", "codigo.py"), "w") as fh:
-        fh.write("print('protegido')\n")
+    for protegido in (os.path.join(home, ".npm", "_npx", "1", "node_modules", "mcp"), os.path.join(home, "Library", "Caches", "pip", "wheels")):
+        os.makedirs(protegido, exist_ok=True)
+        with open(os.path.join(protegido, "x"), "w") as fh:
+            fh.write("fuera de la lista blanca\n")
     cfg_ruta = os.path.join(zona, "reglas.toml")
     with open(cfg_ruta, "w") as fh:
-        fh.write('[general]\nusar_lsof = false\nbaja_prioridad = false\n[[regla]]\nid = "caches"\ntipo = "ruta"\n'
-                 'rutas = ["~/Library/Caches"]\nriesgo = "medio"\nedad_minima_dias = 0\n')
+        fh.write('[general]\nusar_lsof = false\nbaja_prioridad = false\n[proteccion]\nrutas = ["~/.npm/_npx"]\n'
+                 '[[regla]]\nid = "pip"\ntipo = "herramienta"\nherramienta = "pip"\nriesgo = "bajo"\nedad_minima_dias = 0\n'
+                 '[[regla]]\nid = "npm"\ntipo = "herramienta"\nherramienta = "npm"\nriesgo = "bajo"\nedad_minima_dias = 0\n')
     cfg = _cargar_cfg_zona(cfg_ruta, zona)
     vacio = sistema.FicherosAbiertos([], disponible=True)
-    escaneo = ejecutar_scan(cfg, abiertos=vacio, zona=zona)
+    escaneo = ejecutar_scan(cfg, abiertos=vacio, zona=zona, herramientas_fijas=zona_mod.herramientas_de_zona(zona))
     plan = crear_plan(escaneo, cfg, abiertos=vacio)
     ruta_plan = guardar(plan, os.path.join(zona, "informes"))
     r_apply = Aplicador(plan, abiertos=vacio).aplicar()
@@ -294,11 +293,12 @@ def cmd_sombra(a: argparse.Namespace) -> int:
             escaneo = ejecutar_scan(cfg, abiertos=abiertos, zona=zona,
                                     herramientas_fijas=herramientas_de_zona(zona) if zona else None)
         ruta_ant = a.anterior or sombra.ultimo(salida)
-        anterior = None
+        anterior = cand_ant = None
         if ruta_ant:
             with open(ruta_ant, encoding="utf-8") as fh:
                 anterior = json.load(fh)
-        doc = sombra.evaluar(escaneo, cfg, abiertos=abiertos, anterior=anterior)
+            cand_ant = sombra.cargar_candidatos(ruta_ant)
+        doc, lista = sombra.evaluar(escaneo, cfg, abiertos=abiertos, anterior=anterior, candidatos_anteriores=cand_ant)
     except (PlanNoValido, ErrorConfig, zona_mod.ZonaNoValida, OSError, ValueError) as exc:
         print(f"Sombra rechazada: {exc}", file=sys.stderr)
         return 2
@@ -308,13 +308,38 @@ def cmd_sombra(a: argparse.Namespace) -> int:
     ruta = os.path.join(salida, f"sombra-{sello}.json")
     with open(ruta, "w", encoding="utf-8") as fh:
         json.dump(doc, fh, ensure_ascii=False, indent=1)
+    sombra.guardar_candidatos(ruta[:-5] + "-candidatos.jsonl", lista)
     with open(ruta[:-5] + ".md", "w", encoding="utf-8") as fh:
         fh.write(sombra.markdown(doc))
     t = doc["candidatos"]["totales"]
     print(f"Sombra: {t['ficheros']:,} candidatos; lista blanca {t['lista_blanca_ficheros']:,} ficheros "
-          f"({t['lista_blanca_bytes'] / 1e6:.1f} MB). Nada se ha movido ni borrado.")
+          f"({t['lista_blanca_bytes'] / 1e6:.1f} MB); verificaciones bloqueantes: {doc['verificaciones']['bloqueantes']}. "
+          "Nada se ha movido ni borrado.")
     print(f"JSON: {ruta}")
     print(f"Informe: {ruta[:-5]}.md")
+    if a.observacion:
+        from . import observacion
+        reg = observacion.registrar(salida, doc, ruta)
+        dias = observacion.resumen(salida, incluir_sinteticas=bool(zona))["dias_observados"]
+        print(f"Observación registrada: {reg['fecha']} (días observados: {dias} de {observacion.DIAS_REQUERIDOS}).")
+    return 0
+
+
+def cmd_observacion(a: argparse.Namespace) -> int:
+    """Resumen de las observaciones en sombra registradas (solo lectura salvo el propio resumen)."""
+    from . import observacion
+    salida = os.path.realpath(a.salida) if a.salida else SALIDA_DEF
+    os.makedirs(os.path.join(salida, "observacion"), exist_ok=True)
+    guardia.activar(salida)
+    r = observacion.resumen(salida)
+    sello = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    base = os.path.join(salida, "observacion", f"resumen-{sello}")
+    with open(base + ".json", "w", encoding="utf-8") as fh:
+        json.dump(r, fh, ensure_ascii=False, indent=1)
+    with open(base + ".md", "w", encoding="utf-8") as fh:
+        fh.write(observacion.markdown(r))
+    print(observacion.markdown(r))
+    print(f"Resumen: {base}.md")
     return 0
 
 
@@ -402,7 +427,13 @@ def main(argv: list[str] | None = None) -> int:
     so.add_argument("--salida", default=None)
     so.add_argument("--sin-lsof", action="store_true")
     so.add_argument("--zona-sintetica", help="Evaluar una zona sintética (cachés de npm y pip ficticias)")
+    so.add_argument("--observacion", action="store_true",
+                    help="F4A: anotar esta ejecución en el registro de observación de 7 días (docs/F4.md)")
     so.set_defaults(func=cmd_sombra)
+
+    ob = sub.add_parser("observacion", help="F4A: resumen de las observaciones en sombra registradas")
+    ob.add_argument("--salida", default=None)
+    ob.set_defaults(func=cmd_observacion)
 
     cl = sub.add_parser("clave", help="F3: clave HMAC en el Llavero (estado | crear | rotar)")
     cl.add_argument("accion", choices=("estado", "crear", "rotar"))

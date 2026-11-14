@@ -25,15 +25,56 @@ from maccleaner.manifiesto import Manifiesto, ManifiestoCorrupto  # noqa: E402
 from maccleaner.plan import PlanNoValido, calcular_huella, crear_plan, guardar  # noqa: E402
 from maccleaner.purgar import purgar, seleccionar  # noqa: E402
 from maccleaner.restaurar import restaurar  # noqa: E402
+from maccleaner.listablanca import ListaBlanca  # noqa: E402
 from maccleaner.sistema import FicherosAbiertos  # noqa: E402
 
 DIA = 86400
 PROYECTO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 VACIO = FicherosAbiertos([], disponible=True)
+# F4A: la lista blanca es obligatoria. Estas pruebas de MECÁNICA genérica (F2, F2.5, F3, F3.5) operan sobre
+# ~/Library/Caches ficticio de una zona sintética, que la lista OFICIAL no admite; usan una lista de laboratorio que
+# solo se puede pasar desde código Python (nunca desde la CLI, el TOML ni el plan). test_f4a prueba la OFICIAL.
+LAB = ListaBlanca({"caches": {"rutas": True, "subdirectorios": (".",)}}, "laboratorio-pruebas")
 # F3: clave sintética para los procesos hijo de las pruebas de CLI (solo zonas sintéticas; no es el Llavero).
 HEX_SINTETICA = "5a" * 32
 ENV_CLI = {"PATH": "/usr/bin:/bin:/usr/sbin", "HOME": os.path.expanduser("~"), "TMPDIR": os.environ.get("TMPDIR", ""),
            aut.ENV_SINTETICA: HEX_SINTETICA}
+
+
+TOML_NPM_PIP = """
+[general]
+usar_lsof = false
+baja_prioridad = false
+[proteccion]
+rutas = ["~/.npm/_npx", "~/Library/Caches/ms-playwright-mcp"]
+marcadores_proyecto = [".git", "package.json"]
+marcadores_venv = ["pyvenv.cfg"]
+[[regla]]
+id = "pip"
+tipo = "herramienta"
+herramienta = "pip"
+riesgo = "bajo"
+edad_minima_dias = 0
+[[regla]]
+id = "npm"
+tipo = "herramienta"
+herramienta = "npm"
+riesgo = "bajo"
+edad_minima_dias = 0
+"""
+
+
+def fixture_npm_pip(test) -> dict:
+    """F4A: la CLI aplica siempre la lista blanca OFICIAL; sus pruebas usan cachés npm/pip ficticias de la zona."""
+    with open(test.cfg_ruta, "w") as fh:
+        fh.write(TOML_NPM_PIP)
+    home = os.path.join(test.zona, "home")
+    return {
+        "a": escribir(os.path.join(home, ".npm", "_cacache", "content-v2", "sha512", "aa", "bb", "a"), 10_000),
+        "b": escribir(os.path.join(home, ".npm", "_cacache", "index-v5", "cc", "dd", "b"), 5_000),
+        "c": escribir(os.path.join(home, "Library", "Caches", "pip", "http-v2", "1", "2", "c"), 20_000),
+        "d": escribir(os.path.join(home, "Library", "Caches", "pip", "http", "3", "d"), 7_000),
+    }
 
 
 class Caida(BaseException):
@@ -134,10 +175,11 @@ class ZonaBase(unittest.TestCase):
         return ejecutar_scan(self.cfg(), abiertos=VACIO, zona=self.zona, ahora=ahora or self.T0)
 
     def planificar(self, escaneo=None, ahora=None, **kw):
+        kw.setdefault("lista_blanca", LAB)
         return crear_plan(escaneo or self.escanear(), self.cfg(), abiertos=VACIO, ahora=ahora or self.T0 + 60, **kw)
 
     def aplicador(self, plan, ahora=None, abiertos=VACIO):
-        return Aplicador(plan, ahora=ahora or self.T0 + 120, abiertos=abiertos)
+        return Aplicador(plan, ahora=ahora or self.T0 + 120, abiertos=abiertos, lista_blanca=LAB)
 
     def rutas_plan(self, plan):
         return {e["ruta"] for e in plan["elementos"]}
@@ -189,7 +231,8 @@ class TestPlan(ZonaBase):
 
     def test_grupo_abierto_ahora_se_excluye(self):
         esc = self.escanear()
-        plan = crear_plan(esc, self.cfg(), abiertos=FicherosAbiertos([self.f["d"]], disponible=True), ahora=self.T0 + 60)
+        plan = crear_plan(esc, self.cfg(), abiertos=FicherosAbiertos([self.f["d"]], disponible=True), ahora=self.T0 + 60,
+                          lista_blanca=LAB)
         self.assertNotIn(self.f["d"], self.rutas_plan(plan))
 
 
@@ -560,6 +603,7 @@ class TestCompatibilidadYCLI(ZonaBase):
     def test_cli_ciclo_completo_con_guardia(self):
         lanz = os.path.join(PROYECTO, "mac-cleaner")
         env = ENV_CLI
+        self.f = fixture_npm_pip(self)
 
         def run(*args):
             return subprocess.run([lanz, *args], capture_output=True, text=True, env=env, timeout=120)

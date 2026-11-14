@@ -1,8 +1,12 @@
-"""F3: lista blanca inicial para una futura limpieza real. NO habilita nada.
+"""Lista blanca de limpieza (F3; integrada en plan y apply en F4A). NO habilita la limpieza real.
 
 La limpieza de datos reales sigue bloqueada por `zona.LIMPIEZA_REAL_HABILITADA = False` y por la puerta de zona
-de `plan.validar_plan`. Este módulo define QUÉ podría limpiarse cuando el usuario lo autorice, y hoy solo lo
-usa el modo sombra para clasificar candidatos.
+de `plan.validar_plan`. Desde F4A la lista blanca es OBLIGATORIA en `plan` (solo entran elementos permitidos),
+en `apply` (se recalcula al empezar y se vuelve a comprobar cada elemento inmediatamente antes de moverlo) y en
+`sombra` (los mismos criterios). No se puede ampliar desde el TOML (la regla debe ser de tipo herramienta y con la
+herramienta esperada), ni desde argumentos, ni desde el plan (el campo `lista_blanca` del plan es informativo).
+`ListaBlanca` admite otras definiciones solo desde código Python: las pruebas de mecánica genérica de F2 usan una
+lista «de laboratorio» en zonas sintéticas; la CLI y `demo` usan siempre `OFICIAL`.
 
 Alcance: exclusivamente las cachés de contenido regenerables de npm y pip.
   * npm  → `<caché de npm>/_cacache` (blobs direccionados por contenido e índice; npm los vuelve a descargar).
@@ -19,7 +23,7 @@ from __future__ import annotations
 import os
 import re
 
-from .guards import bajo
+from .guards import bajo, expandir
 
 LISTA_BLANCA = {
     "npm": {"herramienta": "npm", "subdirectorios": ("_cacache",),
@@ -79,15 +83,86 @@ def subarboles(reglas_escaneo: list[dict], home: str) -> tuple[dict[str, list[st
 
 
 def clasificar(regla: str, ruta: str, subs: dict[str, list[str]]) -> tuple[bool, str]:
-    """(True, motivo) si el fichero quedaría cubierto por la lista blanca; (False, motivo) si no."""
-    if regla not in LISTA_BLANCA:
-        return False, f"la regla «{regla}» no está en la lista blanca inicial (solo npm y pip)"
-    if regla not in subs:
-        return False, f"la caché de «{regla}» no está disponible o su raíz no es aceptable"
-    sub = next((s for s in subs[regla] if bajo(ruta, s) and ruta != s), None)
-    if sub is None:
-        return False, f"fuera de los subdirectorios permitidos de {regla} ({', '.join(LISTA_BLANCA[regla]['subdirectorios'])})"
-    rel = ruta[len(sub):].strip("/").split("/")
-    if any(COMPONENTES_PROHIBIDOS.match(c) for c in rel):
-        return False, "la ruta contiene un componente de instalación o entorno"
-    return True, f"{regla}: {os.path.basename(sub)}"
+    """(compatibilidad F3) Clasificación con la lista blanca oficial."""
+    return OFICIAL.clasificar(regla, ruta, subs)
+
+
+class ListaBlanca:
+    """Definición de lo limpiable. Cada entrada: regla → {"herramienta": nombre} (raíz = la caché que declara la
+    herramienta) o {"rutas": True} (raíces = las rutas de la regla; SOLO laboratorio), más "subdirectorios"
+    ("." = la raíz entera)."""
+
+    def __init__(self, entradas: dict, nombre: str):
+        self.entradas = entradas
+        self.nombre = nombre
+
+    @property
+    def oficial(self) -> bool:
+        return self is OFICIAL
+
+    def subarboles(self, cfg, herramientas: dict) -> tuple[dict[str, list[str]], list[dict]]:
+        """{regla: [subárboles]} según la configuración y las cachés de las herramientas; y los rechazos."""
+        reglas = {r.id: r for r in cfg.reglas}
+        out, rechazos = {}, []
+        for rid, ent in self.entradas.items():
+            r = reglas.get(rid)
+            if r is None:
+                continue
+            raices = []
+            if ent.get("herramienta"):
+                info = herramientas.get(ent["herramienta"]) or {}
+                if r.tipo != "herramienta" or r.herramienta != ent["herramienta"]:
+                    rechazos.append({"regla": rid, "motivo": f"la regla «{rid}» del TOML no es la herramienta "
+                                                             f"{ent['herramienta']}: la lista blanca no se aplica"})
+                    continue
+                if not info.get("disponible") or not info.get("ruta"):
+                    continue
+                raices = [os.path.realpath(info["ruta"])]
+            elif ent.get("rutas"):
+                if r.tipo != "ruta":
+                    continue
+                raices = [os.path.realpath(expandir(x, cfg.home, cfg.tmpdir)) for x in r.rutas]
+            for raiz in raices:
+                motivo = motivo_raiz(raiz, cfg.home) if self.oficial else None
+                if motivo:
+                    rechazos.append({"regla": rid, "raiz": raiz, "motivo": motivo})
+                    continue
+                out.setdefault(rid, []).extend(raiz if s == "." else os.path.join(raiz, s) for s in ent["subdirectorios"])
+        return out, rechazos
+
+    def clasificar(self, regla: str, ruta: str, subs: dict[str, list[str]]) -> tuple[bool, str]:
+        if regla not in self.entradas:
+            return False, f"la regla «{regla}» no está en la lista blanca ({self.nombre})"
+        if regla not in subs:
+            return False, f"la caché de «{regla}» no está disponible o su raíz no es aceptable"
+        sub = next((x for x in subs[regla] if bajo(ruta, x) and ruta != x), None)
+        if sub is None:
+            return False, f"fuera de los subdirectorios permitidos de {regla} ({', '.join(self.entradas[regla]['subdirectorios'])})"
+        rel = ruta[len(sub):].strip("/").split("/")
+        if any(COMPONENTES_PROHIBIDOS.match(c) for c in rel):
+            return False, "la ruta contiene un componente de instalación o entorno"
+        return True, f"{regla}: {os.path.basename(sub)}"
+
+    def raiz_sigue_aceptable(self, ruta: str, subs: dict[str, list[str]], regla: str, home: str) -> str | None:
+        """Revalidación inmediatamente anterior al movimiento: la raíz de la caché sigue sin marcadores de proyecto
+        o entorno (en ella o en sus antepasados) y el subárbol sigue siendo un directorio real."""
+        sub = next((x for x in subs.get(regla, []) if bajo(ruta, x) and ruta != x), None)
+        if sub is None:
+            return "fuera de la lista blanca"
+        if not self.oficial:
+            return None
+        try:
+            if os.path.islink(sub) or not os.path.isdir(sub):
+                return "el subárbol de la lista blanca ya no es un directorio real"
+        except OSError as exc:
+            return f"no se puede comprobar el subárbol: {exc}"
+        return motivo_raiz(os.path.dirname(sub), home)
+
+
+OFICIAL = ListaBlanca(LISTA_BLANCA, "oficial")
+
+
+def herramientas_de_escaneo(reglas_escaneo: list[dict]) -> dict:
+    """Información de herramientas registrada en un escaneo ({"npm": {...}, "pip": {...}})."""
+    return {r["herramienta"]["herramienta"]: r["herramienta"] for r in reglas_escaneo
+            if isinstance(r.get("herramienta"), dict) and r["herramienta"].get("herramienta")}

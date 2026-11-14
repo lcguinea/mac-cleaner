@@ -109,3 +109,12 @@ def exigir_dentro(ruta: str, zona: str) -> str:
     if rel.split("/")[0] in (NOMBRE_CUARENTENA, MARCADOR):
         raise ZonaNoValida("la ruta apunta a la cuarentena o al marcador de la zona")
     return rel
+
+
+def herramientas_de_zona(zona: str) -> dict:
+    """En una zona sintética las herramientas no se consultan: sus cachés son las ficticias de la zona."""
+    home = os.path.join(zona, "home")
+    return {"npm": {"herramienta": "npm", "disponible": True, "ruta": os.path.join(home, ".npm"), "origen": "zona sintética"},
+            "pip": {"herramienta": "pip", "disponible": True, "ruta": os.path.join(home, "Library", "Caches", "pip"),
+                    "origen": "zona sintética"},
+            "brew": {"herramienta": "brew", "disponible": False, "motivo": "zona sintética"}}

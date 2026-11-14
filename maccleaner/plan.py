@@ -23,6 +23,7 @@ import secrets
 import time
 
 from . import autenticacion as aut
+from . import listablanca
 from . import zona as zona_mod
 from .config import Config
 from .escaner import DIA, Escaner, ref_antiguedad
@@ -57,8 +58,12 @@ def sha256_fichero(ruta: str) -> str:
 def crear_plan(escaneo: dict, cfg: Config, *, ruta_escaneo: str = "", ahora: float | None = None,
                abiertos: FicherosAbiertos | None = None, hash_max_bytes: int = 64 << 20,
                calcular_hash: bool = True, caducidad_h: float = CADUCIDAD_PLAN_H,
-               clave: aut.Clave | None = None, firmar: bool = True) -> dict:
-    """Con zona sintética el plan se firma con `clave` (por defecto, la activa del almacén actual)."""
+               clave: aut.Clave | None = None, firmar: bool = True,
+               lista_blanca: "listablanca.ListaBlanca | None" = None, filtrar: bool = True) -> dict:
+    """Con zona sintética el plan se firma con `clave` (por defecto, la activa del almacén actual).
+    F4A: solo entran elementos de la lista blanca (por defecto la OFICIAL); el resto va a `excluidos` con su motivo.
+    `filtrar=False` solo lo usa la sombra, que clasifica todo para informar (su plan nunca es aplicable)."""
+    lb = lista_blanca or listablanca.OFICIAL
     ahora = ahora or time.time()
     t_esc = float(escaneo.get("ahora", 0))
     if not t_esc:
@@ -79,6 +84,8 @@ def crear_plan(escaneo: dict, cfg: Config, *, ruta_escaneo: str = "", ahora: flo
             except aut.ClaveNoDisponible as exc:
                 raise PlanNoValido(f"no se puede firmar el plan: {exc}") from exc
     esc = Escaner(cfg, abiertos=abiertos or FicherosAbiertos(), ahora=ahora, limite=zona)
+    herramientas = zona_mod.herramientas_de_zona(zona) if zona else listablanca.herramientas_de_escaneo(escaneo["escaneo"]["reglas"])
+    subs, rechazos_lb = lb.subarboles(cfg, herramientas)
     reglas = {r.id: r for r in cfg.reglas}
     elementos, excluidos = [], []
 
@@ -112,6 +119,10 @@ def crear_plan(escaneo: dict, cfg: Config, *, ruta_escaneo: str = "", ahora: flo
                 excluidos.append({**base, "motivo": "activo ahora (modificado después del umbral)"})
                 continue
             for ruta, st in ficheros:
+                ok_lb, motivo_lb = lb.clasificar(regla.id, ruta, subs)
+                if filtrar and not ok_lb:
+                    excluidos.append({**base, "ruta": ruta, "motivo": f"fuera de la lista blanca: {motivo_lb}"})
+                    continue
                 if st.st_nlink > 1:
                     excluidos.append({**base, "ruta": ruta, "motivo": "enlace duro: moverlo no libera espacio"})
                     continue
@@ -130,6 +141,7 @@ def crear_plan(escaneo: dict, cfg: Config, *, ruta_escaneo: str = "", ahora: flo
                     "tam": st.st_size, "bloques": st.st_blocks, "mtime_ns": st.st_mtime_ns,
                     "ctime_ns": st.st_ctime_ns, "birthtime": getattr(st, "st_birthtime", None),
                     "sha256": sha, "edad_minima_dias": regla.edad_minima_dias,
+                    "lista_blanca": motivo_lb if ok_lb else None,
                 })
 
     plan = {
@@ -143,6 +155,7 @@ def crear_plan(escaneo: dict, cfg: Config, *, ruta_escaneo: str = "", ahora: flo
         "hash": {"calculado": calcular_hash, "max_bytes": hash_max_bytes},
         "totales": {"elementos": len(elementos), "bytes_fisicos": sum(e["bloques"] * 512 for e in elementos),
                     "bytes_logicos": sum(e["tam"] for e in elementos)},
+        "lista_blanca": {"nombre": lb.nombre, "subarboles": subs, "rechazos": rechazos_lb, "filtrada": filtrar},
         "elementos": elementos, "excluidos": excluidos[:2000], "n_excluidos": len(excluidos),
         "nota_huella": "SHA-256 de integridad del contenido; no es una firma autenticada.",
     }
