@@ -3,8 +3,12 @@
 Alternativa propia a las funciones de limpieza de CleanMyMac, basada en la investigación REA-004
 (informe y evidencias locales, no versionados: contienen metadatos de binarios propietarios y datos del equipo).
 
-**Estado: F2, auditada en F2.5** (14-11-2026; defectos y correcciones en `docs/SEGURIDAD-F2.md` §8).
+**Estado: F3** (14-11-2026): preparación para la limpieza real, que **sigue deshabilitada**. F2.5 (auditoría) en
+`docs/SEGURIDAD-F2.md` §8; F3 (HMAC, lista blanca npm/pip, modo sombra) en `docs/SEGURIDAD-F3.md`.
 - F1 (`scan`, `report`) es de solo lectura y funciona sobre el Mac real.
+- F3 (`sombra`, `clave`) firma planes y manifiestos con HMAC-SHA256 (clave en el Llavero), define una lista blanca
+  limitada a las cachés regenerables de npm (`_cacache`) y pip (`http-v2`, `http`) y evalúa en sombra qué se
+  limpiaría, sin mover nada.
 - F2 (`plan`, `apply`, `restore`, `purge`) añade limpieza **reversible** mediante cuarentena. Hoy está restringida a
   **zonas sintéticas** (directorios temporales de prueba con marcador): la limpieza de datos reales está
   deshabilitada en el código (`zona.LIMPIEZA_REAL_HABILITADA = False`). Ver `docs/SEGURIDAD-F2.md`.
@@ -31,6 +35,20 @@ Alternativa propia a las funciones de limpieza de CleanMyMac, basada en la inves
 ./mac-cleaner purge --zona ZONA [--dias 14] [--ejecutar]   # sin --ejecutar solo lista
 ./mac-cleaner oficiales                                # brew, npm y pip: reversibles frente a destructivas
 ```
+
+### F3 (preparación; nada real se mueve)
+
+```bash
+./mac-cleaner sombra                       # escanea (solo lectura) y evalúa la lista blanca: informes/sombra-….{json,md}
+./mac-cleaner sombra --zona-sintetica ZONA --config ZONA/reglas.toml
+./mac-cleaner clave estado                 # id de la clave activa (nunca el secreto)
+./mac-cleaner clave crear                  # SOLO por decisión del usuario: crea la clave HMAC en el Llavero
+./mac-cleaner clave rotar                  # nueva clave activa; las antiguas siguen verificando sus operaciones
+./mac-cleaner restore --zona ZONA --operacion OP --recuperacion-sin-clave   # clave perdida (ver SEGURIDAD-F3 §3.3)
+```
+
+`plan` y `apply` en zona sintética necesitan una clave: la del Llavero o, en pruebas, `MAC_CLEANER_CLAVE_SINTETICA`
+(64 dígitos hexadecimales; una clave sintética nunca autoriza datos reales). `demo` usa una clave sintética efímera.
 
 Una zona sintética es un directorio bajo `$TMPDIR` o `/private/tmp` con el marcador
 `.mac-cleaner-zona-sintetica` (lo crea `zona.crear_zona()` o `demo`), con `home/` y `tmp/` ficticios dentro.
@@ -107,11 +125,18 @@ Para cada grupo (primer componente bajo la raíz) el informe da:
 ## Pruebas
 
 ```bash
-/opt/homebrew/bin/python3 -B -m unittest discover -s tests -v    # 67 pruebas, ~5 s
+/opt/homebrew/bin/python3 -B -m unittest discover -s tests -v    # 92 pruebas, ~7 s
 ```
 
-Son 67 pruebas: 16 de F1 (`tests/test_escaner.py`), 31 de F2 (`tests/test_f2.py`) y 20 de la auditoría F2.5
-(`tests/test_f25.py`, una por defecto reproducido más garantías nuevas). Todas las de aplicación,
+Son 92 pruebas: 16 de F1 (`tests/test_escaner.py`), 31 de F2 (`tests/test_f2.py`), 20 de la auditoría F2.5
+(`tests/test_f25.py`) y 25 de F3 (`tests/test_f3.py`). Ninguna toca el Llavero real: usan claves sintéticas en memoria.
+
+**F3** cubre: planes y manifiestos alterados (con la huella recalculada), MAC ausente o manipulado, clave incorrecta,
+ausente, perdida o rotada, planes v1, clave sintética sobre datos reales, plan de otra zona, reproducción en serie y en
+paralelo, registros o manifiestos de otra operación, recuperación sin clave (y purga bloqueada), interrupción durante
+un apply firmado, sustitución tras firmar, fichero grande con ctime «legalizado», almacén del Llavero simulado, lista
+blanca (subárboles, `_npx`, `node_modules` dentro de la caché, raíces dentro de entornos o proyectos, rutas protegidas)
+y modo sombra (sin modificar nada, con cambios entre ejecuciones y por la CLI con la guardia). Todas las de aplicación,
 restauración y purga usan solo ficheros ficticios dentro de zonas sintéticas temporales.
 
 **F2** cubre: ciclo completo con restauración exacta (SHA-256, modo, uid, `mtime_ns`, inodo, birthtime y xattr),
@@ -143,10 +168,13 @@ maccleaner/guardia.py    guardia de solo lectura en tiempo de ejecución
 maccleaner/herramientas.py  localización no destructiva de las cachés de brew, pip y npm
 maccleaner/sistema.py    prioridad baja, lsof, disco, snapshots
 maccleaner/informe.py    JSON → Markdown
-maccleaner/cli.py        órdenes scan, report, plan, apply, restore, purge, oficiales, demo
+maccleaner/cli.py        órdenes scan, report, plan, apply, restore, purge, oficiales, demo, sombra, clave
 maccleaner/zona.py       puerta de zona sintética (LIMPIEZA_REAL_HABILITADA = False)
 maccleaner/fsseguro.py   openat con O_NOFOLLOW, renameatx_np(RENAME_EXCL), SHA-256 por descriptor
-maccleaner/manifiesto.py manifiesto JSON Lines encadenado con fsync, flock y O_NOFOLLOW
+maccleaner/manifiesto.py manifiesto JSON Lines encadenado con fsync, flock, O_NOFOLLOW y MAC por registro
+maccleaner/autenticacion.py  HMAC-SHA256 de planes y manifiestos; clave en el Llavero (ctypes) o sintética
+maccleaner/listablanca.py    lista blanca inicial para limpieza real (npm _cacache, pip http-v2/http)
+maccleaner/sombra.py         ejecución en sombra: candidatos, exclusiones, riesgos, cambios, autorizaciones
 maccleaner/plan.py       creación y validación de planes
 maccleaner/aplicar.py    apply (cuarentena)
 maccleaner/restaurar.py  restore
@@ -155,4 +183,5 @@ maccleaner/oficiales.py  brew, npm y pip: reversibles frente a destructivas
 tests/                   pruebas focalizadas (unittest)
 informes/                resultados de los escaneos (local, no versionado)
 docs/SEGURIDAD-F2.md     modelo de amenazas, metadatos, limitaciones, auditoría F2.5 y plan de habilitación real
+docs/SEGURIDAD-F3.md     autenticación, claves, lista blanca, sombra, riesgos y procedimiento de autorización
 ```

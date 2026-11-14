@@ -20,18 +20,23 @@ Orden de comprobaciones (todas antes de tocar nada):
      ajeno queda «retenido» y registrado) → `movido` con el ctime en cuarentena (fsync).
 La cuarentena debe ser del usuario y no escribible por grupo ni otros, y la operación se hace con el
 manifiesto bloqueado (flock): un restore o purge simultáneo de la misma operación se rechaza.
+
+F3: el plan debe tener un MAC HMAC-SHA256 válido; el manifiesto se firma con la misma clave. Antes de mover
+nada se RESERVA el id del plan en `<cuarentena>/planes-aplicados/<id>` (creación exclusiva O_EXCL): un plan
+solo se puede aplicar una vez, aunque se borre su operación o se ejecuten dos apply a la vez.
 Un elemento que no supera una comprobación se OMITE (con motivo) y se sigue con el siguiente. Un error del
 sistema al mover ABORTA el resto: lo ya movido queda registrado y es restaurable.
 """
 from __future__ import annotations
 
 import datetime as dt
+import json
 import os
 import secrets
 import stat
 import time
 
-from . import fsseguro, zona as zona_mod
+from . import autenticacion as aut, fsseguro, zona as zona_mod
 from .config import cargar as cargar_config
 from .escaner import DIA, ref_antiguedad, riesgo_de
 from .guards import bajo, expandir
@@ -40,6 +45,7 @@ from .plan import PlanNoValido, sha256_fichero, validar_plan
 from .sistema import FicherosAbiertos
 
 DIR_ARCHIVOS = "archivos"
+DIR_PLANES = "planes-aplicados"
 
 
 def directorio_cuarentena(zona: str) -> str:
@@ -51,6 +57,7 @@ class Aplicador:
         self.plan = plan
         self.ahora = ahora or time.time()
         self.zona = validar_plan(plan, self.ahora)
+        self.clave = aut.verificar_plan(plan)          # ya verificado en validar_plan; se reutiliza su clave
         for clave in ("home", "tmpdir"):
             if not bajo(os.path.realpath(plan[clave]), self.zona):
                 raise PlanNoValido(f"el {clave} del plan no está dentro de la zona sintética")
@@ -154,11 +161,12 @@ class Aplicador:
         qbase = directorio_cuarentena(self.zona)
         op = dt.datetime.fromtimestamp(time.time()).strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(3)
         os.close(fsseguro.asegurar_dir(self.zona, zona_mod.NOMBRE_CUARENTENA, privado=True))
+        self._reservar_plan(qbase, op)
         os.close(fsseguro.asegurar_dir(qbase, op, privado=True))
         qop = os.path.join(qbase, op)
         os.close(fsseguro.asegurar_dir(qop, DIR_ARCHIVOS, privado=True))
         qarch = os.path.join(qop, DIR_ARCHIVOS)
-        man = Manifiesto.crear(os.path.join(qop, "manifiesto.jsonl"), op=op, plan_id=self.plan["id"],
+        man = Manifiesto.crear(os.path.join(qop, "manifiesto.jsonl"), clave=self.clave, op=op, plan_id=self.plan["id"],
                                plan_huella=self.plan["huella"], zona=self.zona, cuarentena=qop,
                                n_elementos=len(self.plan["elementos"]), ahora=self.ahora,
                                lsof={"disponible": self.abiertos.disponible, "n": len(self.abiertos)})
@@ -166,6 +174,20 @@ class Aplicador:
                "bytes_movidos": 0, "abortado": None}
         with man.bloquear():
             return self._aplicar(man, qarch, res)
+
+    def _reservar_plan(self, qbase: str, op: str) -> None:
+        """Un plan se aplica una sola vez: creación exclusiva de un fichero con el id del plan."""
+        os.close(fsseguro.asegurar_dir(qbase, DIR_PLANES, privado=True))
+        ruta = os.path.join(qbase, DIR_PLANES, self.plan["id"])      # id validado: \d{8}-\d{6}-[0-9a-f]{6}
+        try:
+            fd = os.open(ruta, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        except FileExistsError as exc:
+            raise PlanNoValido(f"el plan {self.plan['id']} ya se aplicó: vuelve a ejecutar `scan` y `plan`") from exc
+        try:
+            os.write(fd, json.dumps({"op": op, "huella": self.plan["huella"], "t": time.time()}).encode())
+            os.fsync(fd)
+        finally:
+            os.close(fd)
 
     def _aplicar(self, man: Manifiesto, qarch: str, res: dict) -> dict:
         try:

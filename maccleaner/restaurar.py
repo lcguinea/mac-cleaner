@@ -17,6 +17,11 @@ Robustez (F2.5):
   * los ficheros sin SHA-256 (mayores que hash_max) se comprueban también por ctime: si cambió desde que
     entraron en la cuarentena, alguien los tocó (contenido, permisos o atributos) y no se devuelven.
 
+Autenticación (F3): el manifiesto debe tener MAC válidos con su clave. Si la clave se perdió, la opción
+`sin_clave=True` (CLI: --recuperacion-sin-clave) carga el manifiesto comprobando solo la cadena; las demás
+comprobaciones (inodo, metadatos, SHA-256 o ctime, RENAME_EXCL, puerta de zona) se mantienen y lo anotado
+queda marcado como `recuperacion`. purge nunca actúa sin MAC válidos.
+
 Metadatos: el movimiento es un rename dentro del mismo volumen, así que el inodo es el mismo y se conservan
 el contenido, el modo, el propietario, mtime, atime, birthtime, los atributos extendidos, las ACL y los
 flags. NO se conservan: ctime (rename lo actualiza siempre), la mtime de los directorios padre (cambia al
@@ -29,7 +34,7 @@ import os
 import stat
 
 from . import fsseguro, zona as zona_mod
-from .aplicar import DIR_ARCHIVOS, directorio_cuarentena
+from .aplicar import DIR_ARCHIVOS, DIR_PLANES, directorio_cuarentena
 from .manifiesto import Manifiesto, ManifiestoOcupado  # noqa: F401  (ManifiestoOcupado: lo captura la CLI)
 
 
@@ -37,12 +42,12 @@ class ErrorRestauracion(ValueError):
     pass
 
 
-def cargar_operacion(zona: str, op: str) -> tuple[str, Manifiesto]:
+def cargar_operacion(zona: str, op: str, sin_clave: bool = False) -> tuple[str, Manifiesto]:
     zona = zona_mod.validar_zona(zona)
-    if not op or "/" in op or op.startswith("."):
+    if not op or "/" in op or op.startswith(".") or op == DIR_PLANES:
         raise ErrorRestauracion(f"identificador de operación no válido: {op!r}")
     qop = os.path.join(directorio_cuarentena(zona), op)
-    man = Manifiesto.cargar(os.path.join(qop, "manifiesto.jsonl"))
+    man = Manifiesto.cargar(os.path.join(qop, "manifiesto.jsonl"), verificar=not sin_clave)
     if man.inicio.get("zona") != zona or man.inicio.get("cuarentena") != qop:
         raise ErrorRestauracion("el manifiesto pertenece a otra zona u operación")
     return zona, man
@@ -69,8 +74,9 @@ def _en_origen(zona: str, rel_dir: str, nombre: str, ino: int) -> bool:
         os.close(ofd)
 
 
-def restaurar(zona: str, op: str, *, elemento: str | None = None, ruta: str | None = None) -> dict:
-    zona, man = cargar_operacion(zona, op)
+def restaurar(zona: str, op: str, *, elemento: str | None = None, ruta: str | None = None,
+              sin_clave: bool = False) -> dict:
+    zona, man = cargar_operacion(zona, op, sin_clave)
     with man.bloquear():                     # recarga el manifiesto con la operación bloqueada
         return _restaurar(zona, op, man, elemento, ruta)
 
@@ -91,6 +97,13 @@ def _restaurar(zona: str, op: str, man: Manifiesto, elemento: str | None, ruta: 
         rel = zona_mod.exigir_dentro(e["origen"], zona)
         rel_dir, nombre = os.path.dirname(rel), os.path.basename(rel)
         meta = e["meta"]
+        if e.get("destino") != os.path.join(qarch, rel):
+            # apply guarda cada fichero en archivos/<ruta relativa del origen>: si no coinciden, alguien editó
+            # el origen o el destino (relevante sobre todo en la recuperación sin clave).
+            man.anotar("restaurar_error", id=e["id"], motivo="origen y destino incoherentes en el manifiesto")
+            res["errores"] += 1
+            res["detalle"].append({"id": e["id"], "resultado": "error: origen y destino incoherentes"})
+            continue
         try:
             qfd = fsseguro.abrir_dir(qarch, rel_dir)
         except OSError as exc:

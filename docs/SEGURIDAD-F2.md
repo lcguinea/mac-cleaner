@@ -87,13 +87,15 @@ Recomendación: para las tres, la vía reversible es mover su caché con `plan` 
 - **Ficheros sin hash**: los mayores de `hash_max_mb` (64 MB) se verifican solo por inodo, tamaño, mtime y ctime.
 - **Enlaces duros**: se excluyen del plan, porque moverlos no libera espacio.
 - **Escala**: máximo 200 000 elementos por plan; el plan guarda una entrada por fichero (npm ≈ 16 700 ficheros generaría un JSON de varios MB).
-- **Huella**: es solo de integridad. Una firma real (HMAC con clave en el Llavero) sería una mejora para F3.
+- **Huella**: es solo de integridad. **Resuelto en F3**: planes v2 y manifiestos llevan HMAC-SHA256 con clave en el Llavero (`docs/SEGURIDAD-F3.md`).
 - **lsof**: instantánea al inicio de `apply`. Un fichero que se abra después no se detecta.
 - **Clones de APFS y snapshots**: mover a cuarentena no libera espacio hasta purgar. Con clones o snapshots, ni siquiera la purga libera nada.
 
 ## 7. Plan de habilitación de limpiezas reales (requiere autorización explícita)
 
 Ninguno de estos pasos se ha hecho. Cada uno es una decisión del usuario, con su prueba previa.
+F3 ya preparó la firma HMAC (paso 3), la lista blanca npm/pip y el modo sombra (paso 4). El procedimiento vigente y
+los criterios de la primera limpieza supervisada están en `docs/SEGURIDAD-F3.md` §8.
 
 1. **Decisión escrita** de qué reglas se habilitan. Propuesta inicial: solo `npm` (`_cacache`) y `pip`, riesgo bajo y regenerables.
 2. **Cuarentena real**: `~/.mac-cleaner/cuarentena/` (ya protegida en `guards.py`), en el mismo volumen que `~/Library/Caches` y `~/.npm`. Comprobación de `st_dev` por elemento, como en F2.
@@ -143,5 +145,5 @@ trazabilidad o recuperación imposible con la herramienta, sin borrar datos ajen
 ### 8.3 Riesgos que siguen abiertos
 
 - **Teóricos**: la ventana de `purge` dentro del mismo directorio de la cuarentena (§6), el cambio de contenido del mismo inodo durante `apply` (§6) y un proceso que ignore el `flock`.
-- **Autenticidad**: la huella del plan y la cadena del manifiesto son de integridad. Quien pueda escribirlos puede recalcularlas. Con un manifiesto forjado se puede redirigir `restore` a otra ruta **dentro de la zona** (nunca sobrescribe) o pedir a `purge` que borre otro fichero **de la cuarentena de esa operación** con el inodo coincidente. Solución prevista: HMAC con clave en el Llavero (§7.3).
+- **Autenticidad** (resuelto en F3 con HMAC; queda la recuperación sin clave, ver SEGURIDAD-F3 §7): la huella del plan y la cadena del manifiesto son de integridad. Quien pueda escribirlos puede recalcularlas. Con un manifiesto forjado se puede redirigir `restore` a otra ruta **dentro de la zona** (nunca sobrescribe) o pedir a `purge` que borre otro fichero **de la cuarentena de esa operación** con el inodo coincidente. Solución prevista: HMAC con clave en el Llavero (§7.3).
 - **Aceptadas**: instantánea única de lsof, ficheros grandes verificados por metadatos y ctime (no por contenido) y falsos positivos de ctime (§6).

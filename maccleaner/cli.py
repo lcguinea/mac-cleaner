@@ -2,6 +2,7 @@
 
 F1 (solo lectura, datos reales): scan, report.
 F2 (reversible, SOLO en zonas sintéticas): plan, apply, restore, purge; además oficiales y demo.
+F3: sombra (evaluación sin mover nada) y clave (HMAC en el Llavero); planes y manifiestos autenticados.
 `plan` también funciona sobre escaneos reales como vista previa, pero `apply` lo rechaza (zona.LIMPIEZA_REAL_HABILITADA = False).
 """
 from __future__ import annotations
@@ -33,10 +34,21 @@ def _salida(a: argparse.Namespace, zona: str | None) -> str:
     return os.path.join(zona, "informes") if zona else SALIDA_DEF
 
 
-def ejecutar_scan(cfg, *, abiertos, brew_dry_run=False, solo_reglas=None, zona=None, ahora=None) -> dict:
+def herramientas_de_zona(zona: str) -> dict:
+    """En una zona sintética las herramientas no se consultan: sus cachés son las ficticias de la zona."""
+    home = os.path.join(zona, "home")
+    return {"npm": {"herramienta": "npm", "disponible": True, "ruta": os.path.join(home, ".npm"), "origen": "zona sintética"},
+            "pip": {"herramienta": "pip", "disponible": True, "ruta": os.path.join(home, "Library", "Caches", "pip"),
+                    "origen": "zona sintética"},
+            "brew": {"herramienta": "brew", "disponible": False, "motivo": "zona sintética"}}
+
+
+def ejecutar_scan(cfg, *, abiertos, brew_dry_run=False, solo_reglas=None, zona=None, ahora=None,
+                  herramientas_fijas=None) -> dict:
     """Escaneo completo. Devuelve el documento JSON (lo usan la CLI, demo y las pruebas)."""
     prioridad = sistema.bajar_prioridad() if cfg.baja_prioridad else []
-    esc = Escaner(cfg, abiertos=abiertos, brew_dry_run=brew_dry_run, solo_reglas=solo_reglas, limite=zona, ahora=ahora)
+    esc = Escaner(cfg, abiertos=abiertos, brew_dry_run=brew_dry_run, solo_reglas=solo_reglas, limite=zona, ahora=ahora,
+                  herramientas_fijas=herramientas_fijas)
     res = esc.escanear()
     return {
         "herramienta": "mac-cleaner", "version": __version__, "fase": "F2" if zona else "F1",
@@ -163,7 +175,7 @@ def cmd_restore(a: argparse.Namespace) -> int:
     try:
         zona = zona_mod.validar_zona(a.zona)
         guardia.activar(zona)
-        res = restaurar(zona, a.operacion, elemento=a.elemento, ruta=a.ruta)
+        res = restaurar(zona, a.operacion, elemento=a.elemento, ruta=a.ruta, sin_clave=a.recuperacion_sin_clave)
     except (zona_mod.ZonaNoValida, ManifiestoCorrupto, ManifiestoOcupado, ErrorRestauracion) as exc:
         print(f"restore rechazado: {exc}", file=sys.stderr)
         return 2
@@ -199,7 +211,10 @@ def cmd_demo(a: argparse.Namespace) -> int:
     from .aplicar import Aplicador
     from .plan import crear_plan, guardar
     from .restaurar import restaurar
+    from . import autenticacion as aut
     zona = zona_mod.crear_zona("mac-cleaner-demo-")
+    if not os.environ.get(aut.ENV_SINTETICA):
+        aut.establecer_almacen(aut.AlmacenSintetico.nuevo())   # demo: clave sintética efímera, nunca el Llavero
     guardia.activar(zona)
     caches = os.path.join(zona, "home", "Library", "Caches")
     for i in range(12):
@@ -227,6 +242,67 @@ def cmd_demo(a: argparse.Namespace) -> int:
                       "guardia_bloqueos": [x for x in guardia.registro if x.startswith("BLOQUEADO")]},
                      ensure_ascii=False, indent=1))
     print(f"\nLa zona queda para inspección: {zona} (bórrala cuando quieras; es un directorio temporal).")
+    return 0
+
+
+def cmd_sombra(a: argparse.Namespace) -> int:
+    """F3: evalúa qué se limpiaría (lista blanca npm/pip), sin mover ni borrar nada. Guardia de solo lectura."""
+    from . import sombra
+    from .plan import PlanNoValido
+    zona = zona_mod.validar_zona(a.zona_sintetica) if a.zona_sintetica else None
+    salida = _salida(a, zona)
+    os.makedirs(salida, exist_ok=True)
+    guardia.activar(salida)
+    try:
+        if a.entrada:
+            with open(a.entrada, encoding="utf-8") as fh:
+                escaneo = json.load(fh)
+            if (escaneo.get("zona") or None) != zona:
+                print("El escaneo no corresponde a la zona indicada.", file=sys.stderr)
+                return 2
+        cfg = _cargar_cfg_zona(a.entrada and escaneo["config"] or a.config, zona)
+        abiertos = sistema.FicherosAbiertos.capturar() if (cfg.usar_lsof and not a.sin_lsof) else sistema.FicherosAbiertos()
+        if not a.entrada:
+            escaneo = ejecutar_scan(cfg, abiertos=abiertos, zona=zona,
+                                    herramientas_fijas=herramientas_de_zona(zona) if zona else None)
+        ruta_ant = a.anterior or sombra.ultimo(salida)
+        anterior = None
+        if ruta_ant:
+            with open(ruta_ant, encoding="utf-8") as fh:
+                anterior = json.load(fh)
+        doc = sombra.evaluar(escaneo, cfg, abiertos=abiertos, anterior=anterior)
+    except (PlanNoValido, ErrorConfig, zona_mod.ZonaNoValida, OSError, ValueError) as exc:
+        print(f"Sombra rechazada: {exc}", file=sys.stderr)
+        return 2
+    doc["guardia"] = {"activa": True, "permitido": salida,
+                      "bloqueos": [x for x in guardia.registro if x.startswith("BLOQUEADO")]}
+    sello = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    ruta = os.path.join(salida, f"sombra-{sello}.json")
+    with open(ruta, "w", encoding="utf-8") as fh:
+        json.dump(doc, fh, ensure_ascii=False, indent=1)
+    with open(ruta[:-5] + ".md", "w", encoding="utf-8") as fh:
+        fh.write(sombra.markdown(doc))
+    t = doc["candidatos"]["totales"]
+    print(f"Sombra: {t['ficheros']:,} candidatos; lista blanca {t['lista_blanca_ficheros']:,} ficheros "
+          f"({t['lista_blanca_bytes'] / 1e6:.1f} MB). Nada se ha movido ni borrado.")
+    print(f"JSON: {ruta}")
+    print(f"Informe: {ruta[:-5]}.md")
+    return 0
+
+
+def cmd_clave(a: argparse.Namespace) -> int:
+    """Gestión de la clave HMAC. crear/rotar escriben SOLO en el Llavero y solo con orden expresa del usuario."""
+    from . import autenticacion as aut
+    try:
+        if a.accion == "estado":
+            print(json.dumps(aut.almacen_actual().estado(), ensure_ascii=False, indent=1))
+            return 0
+        almacen = aut.AlmacenLlavero()
+        c = almacen.crear() if a.accion == "crear" else almacen.rotar()
+    except aut.ClaveNoDisponible as exc:
+        print(f"clave: {exc}", file=sys.stderr)
+        return 2
+    print(f"Clave {c.id} guardada en el Llavero (servicio {aut.SERVICIO_LLAVERO}). El secreto no se muestra.")
     return 0
 
 
@@ -271,6 +347,8 @@ def main(argv: list[str] | None = None) -> int:
     rs.add_argument("--operacion", required=True)
     rs.add_argument("--elemento", help="Id del elemento (p. ej. e000003)")
     rs.add_argument("--ruta", help="Ruta original del elemento")
+    rs.add_argument("--recuperacion-sin-clave", action="store_true",
+                    help="Clave perdida: restaurar sin verificar los MAC (cadena, inodo y SHA-256 sí se comprueban)")
     rs.set_defaults(func=cmd_restore)
 
     pu = sub.add_parser("purge", help="Lista (o, con --ejecutar, borra en zona sintética) lo caducado en cuarentena")
@@ -285,6 +363,19 @@ def main(argv: list[str] | None = None) -> int:
 
     de = sub.add_parser("demo", help="Ciclo completo en una zona sintética nueva con ficheros ficticios")
     de.set_defaults(func=cmd_demo)
+
+    so = sub.add_parser("sombra", help="F3: evalúa qué se limpiaría (lista blanca npm/pip) sin mover ni borrar nada")
+    so.add_argument("--entrada", help="JSON de scan (≤ 24 h); si se omite, se escanea ahora")
+    so.add_argument("--anterior", help="Sombra anterior para comparar (por defecto, la más reciente de la salida)")
+    so.add_argument("--config", default=CONFIG_DEF)
+    so.add_argument("--salida", default=None)
+    so.add_argument("--sin-lsof", action="store_true")
+    so.add_argument("--zona-sintetica", help="Evaluar una zona sintética (cachés de npm y pip ficticias)")
+    so.set_defaults(func=cmd_sombra)
+
+    cl = sub.add_parser("clave", help="F3: clave HMAC en el Llavero (estado | crear | rotar)")
+    cl.add_argument("accion", choices=("estado", "crear", "rotar"))
+    cl.set_defaults(func=cmd_clave)
 
     a = p.parse_args(argv)
     return a.func(a)

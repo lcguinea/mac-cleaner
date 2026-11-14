@@ -15,7 +15,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from maccleaner import fsseguro, oficiales, zona as zona_mod  # noqa: E402
+from maccleaner import autenticacion as aut, fsseguro, oficiales, zona as zona_mod  # noqa: E402
 from maccleaner.aplicar import Aplicador, directorio_cuarentena  # noqa: E402
 from maccleaner.cli import ejecutar_scan  # noqa: E402
 from maccleaner.config import cargar  # noqa: E402
@@ -30,6 +30,10 @@ from maccleaner.sistema import FicherosAbiertos  # noqa: E402
 DIA = 86400
 PROYECTO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 VACIO = FicherosAbiertos([], disponible=True)
+# F3: clave sintética para los procesos hijo de las pruebas de CLI (solo zonas sintéticas; no es el Llavero).
+HEX_SINTETICA = "5a" * 32
+ENV_CLI = {"PATH": "/usr/bin:/bin:/usr/sbin", "HOME": os.path.expanduser("~"), "TMPDIR": os.environ.get("TMPDIR", ""),
+           aut.ENV_SINTETICA: HEX_SINTETICA}
 
 
 class Caida(BaseException):
@@ -61,6 +65,10 @@ class ZonaBase(unittest.TestCase):
     EDAD = 30
 
     def setUp(self) -> None:
+        # F3: planes y manifiestos se firman con una clave sintética en memoria (nunca el Llavero real).
+        self.almacen = aut.AlmacenSintetico.nuevo()
+        aut.establecer_almacen(self.almacen)
+        self.addCleanup(aut.establecer_almacen, None)
         self.zona = zona_mod.crear_zona("mc-f2-test-")
         self.caches = os.path.join(self.zona, "home", "Library", "Caches")
         self.cfg_ruta = os.path.join(self.zona, "reglas.toml")
@@ -135,7 +143,10 @@ class ZonaBase(unittest.TestCase):
         return {e["ruta"] for e in plan["elementos"]}
 
     def retocar(self, plan):
+        """Recalcula huella Y MAC con la clave válida: simula a un atacante que TIENE la clave, para probar
+        las capas de defensa que hay detrás de la autenticación (test_f3 prueba la autenticación en sí)."""
         plan["huella"] = calcular_huella(plan)
+        aut.firmar_plan(plan, self.almacen.activa())
         return plan
 
     def todo_en_su_sitio(self, antes: dict):
@@ -314,7 +325,7 @@ class TestApplyRestore(ZonaBase):
         with self.assertRaises(Caida):
             ap.aplicar()
         qbase = directorio_cuarentena(self.zona)
-        op = os.listdir(qbase)[0]
+        op = next(x for x in os.listdir(qbase) if x != "planes-aplicados")
         man = Manifiesto.cargar(os.path.join(qbase, op, "manifiesto.jsonl"))
         self.assertFalse(man.cerrado)
         self.assertEqual(sum(1 for e in man.estados().values() if e["estado"] == "intento"), 1)
@@ -333,7 +344,7 @@ class TestApplyRestore(ZonaBase):
         ap._renombrar = renombrar
         with self.assertRaises(Caida):
             ap.aplicar()
-        op = os.listdir(directorio_cuarentena(self.zona))[0]
+        op = next(x for x in os.listdir(directorio_cuarentena(self.zona)) if x != "planes-aplicados")
         r = restaurar(self.zona, op)
         self.assertEqual((r["restaurados"], r["sin_cambios"], r["errores"]), (0, 1, 0))
         self.todo_en_su_sitio(antes)
@@ -548,7 +559,7 @@ class TestCompatibilidadYCLI(ZonaBase):
 
     def test_cli_ciclo_completo_con_guardia(self):
         lanz = os.path.join(PROYECTO, "mac-cleaner")
-        env = {"PATH": "/usr/bin:/bin:/usr/sbin", "HOME": os.path.expanduser("~"), "TMPDIR": os.environ.get("TMPDIR", "")}
+        env = ENV_CLI
 
         def run(*args):
             return subprocess.run([lanz, *args], capture_output=True, text=True, env=env, timeout=120)

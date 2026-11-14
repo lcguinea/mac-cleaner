@@ -15,6 +15,9 @@ F2.5:
   * el borrado es unlinkat sobre el MISMO descriptor de directorio con el que se comprobó el inodo: sustituir
     un directorio intermedio por un enlace entre la comprobación y el borrado ya no desvía el borrado;
   * los directorios vacíos se retiran con fwalk + rmdirat, sin seguir enlaces.
+
+F3: solo se seleccionan y purgan operaciones cuyo manifiesto tiene MAC válidos con su clave. Sin la clave
+(o con un manifiesto F2 sin autenticar) la operación se descarta; nunca se borra nada «en recuperación».
 """
 from __future__ import annotations
 
@@ -23,7 +26,7 @@ import stat
 import time
 
 from . import fsseguro, zona as zona_mod
-from .aplicar import DIR_ARCHIVOS, directorio_cuarentena
+from .aplicar import DIR_ARCHIVOS, DIR_PLANES, directorio_cuarentena
 from .manifiesto import Manifiesto, ManifiestoCorrupto, ManifiestoOcupado
 
 DIA = 86400
@@ -43,6 +46,8 @@ def seleccionar(zona: str, *, dias: float = DIAS_POR_DEFECTO, ahora: float | Non
     except FileNotFoundError:
         nombres = []
     for op in nombres:
+        if op == DIR_PLANES:
+            continue                       # registro de planes aplicados (F3), no es una operación
         qop = os.path.join(qbase, op)
         if os.path.islink(qop) or not os.path.isdir(qop):
             descartadas.append({"op": op, "motivo": "no es un directorio de operación"})

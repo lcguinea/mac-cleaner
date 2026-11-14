@@ -27,7 +27,8 @@ from maccleaner.plan import PlanNoValido  # noqa: E402
 from maccleaner.purgar import purgar  # noqa: E402
 from maccleaner.restaurar import restaurar  # noqa: E402
 
-from test_f2 import DIA, PROYECTO, Caida, ZonaBase, escribir, huella_fichero  # noqa: E402
+from maccleaner import autenticacion as aut  # noqa: E402
+from test_f2 import DIA, ENV_CLI, HEX_SINTETICA, PROYECTO, Caida, ZonaBase, escribir, huella_fichero  # noqa: E402
 
 
 def elemento_forjado(ruta: str, eid: str, **extra) -> dict:
@@ -40,8 +41,9 @@ def elemento_forjado(ruta: str, eid: str, **extra) -> dict:
     return e
 
 
-def reencadenar(ruta: str, modificar) -> None:
-    """Reescribe un manifiesto aplicando `modificar(registros)` y RECALCULA la cadena (atacante informado)."""
+def reencadenar(ruta: str, modificar, clave: "aut.Clave | None" = None) -> None:
+    """Reescribe un manifiesto aplicando `modificar(registros)` y RECALCULA la cadena (atacante informado).
+    Con `clave` recalcula también los MAC (atacante que TIENE la clave, o paso del tiempo simulado)."""
     with open(ruta) as fh:
         regs = [json.loads(x) for x in fh.read().splitlines()]
     modificar(regs)
@@ -50,7 +52,12 @@ def reencadenar(ruta: str, modificar) -> None:
         for i, r in enumerate(regs):
             r["n"], r["prev"] = i, prev
             r.pop("h", None)
+            mac = r.pop("mac", None)
             r["h"] = _huella(prev, r)
+            if clave is not None:
+                r["mac"] = aut.mac_registro(clave, regs[0]["op"], r)
+            elif mac is not None:
+                r["mac"] = mac                       # sin clave: el MAC antiguo queda y ya no coincide
             prev = r["h"]
             fh.write(json.dumps(r, sort_keys=True) + "\n")
 
@@ -95,7 +102,7 @@ class TestPurgaF25(ZonaBase):
         self.assertTrue(all(os.path.exists(e["destino"]) for e in man.estados().values()))
         lanz = os.path.join(PROYECTO, "mac-cleaner")
         p = subprocess.run([lanz, "purge", "--zona", self.zona, "--dias", "0", "--ejecutar"],
-                           capture_output=True, text=True, timeout=60)
+                           capture_output=True, text=True, env=ENV_CLI, timeout=60)
         self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
         self.assertTrue(all(os.path.exists(e["destino"]) for e in man.estados().values()))
 
@@ -110,7 +117,7 @@ class TestPurgaF25(ZonaBase):
                 if r.get("evento") == "intento" and r["id"] == primero:
                     r["destino"] = qarch
 
-        reencadenar(res["manifiesto"], forjar)
+        reencadenar(res["manifiesto"], forjar, clave=self.almacen.activa())   # atacante CON la clave
         r = purgar(self.zona, dias=14, ahora=man.inicio["t"] + 20 * DIA, ejecutar=True)
         self.assertEqual((r["borrados"], r["errores"]), (3, 1))
 
@@ -346,10 +353,14 @@ class TestApplyF25(ZonaBase):
         self.todo_en_su_sitio(antes)
 
     def test_reproducir_un_plan_tras_restaurar_no_vuelve_a_mover(self):
-        """Garantía (sin defecto): el rename cambia ctime, así que un plan ya aplicado no se puede repetir."""
+        """Garantía: un plan aplicado no se puede repetir. F3: la reserva del id lo rechaza; si alguien borra la
+        reserva, sigue la segunda capa de F2.5 (el rename cambió el ctime)."""
         plan = self.planificar()
         res = self.aplicador(plan).aplicar()
         restaurar(self.zona, res["op"])
+        with self.assertRaisesRegex(PlanNoValido, "ya se aplicó"):
+            self.aplicador(plan).aplicar()
+        os.remove(os.path.join(directorio_cuarentena(self.zona), "planes-aplicados", plan["id"]))
         res2 = self.aplicador(plan).aplicar()
         self.assertEqual(res2["movidos"], 0)
         est = Manifiesto.cargar(res2["manifiesto"]).estados()
@@ -399,9 +410,8 @@ class TestCLIF25(ZonaBase):
     EDAD = 0                       # la CLI usa la hora real: los ficheros ficticios acaban de crearse
 
     def run_cli(self, *args):
-        env = {"PATH": "/usr/bin:/bin:/usr/sbin", "HOME": os.path.expanduser("~"), "TMPDIR": os.environ.get("TMPDIR", "")}
         return subprocess.run([os.path.join(PROYECTO, "mac-cleaner"), *args], capture_output=True, text=True,
-                              env=env, timeout=120)
+                              env=ENV_CLI, timeout=120)
 
     def _plan_cli(self):
         p = self.run_cli("scan", "--zona-sintetica", self.zona, "--config", self.cfg_ruta, "--sin-lsof")
@@ -416,7 +426,8 @@ class TestCLIF25(ZonaBase):
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         res = json.loads(p.stdout)
         # Se envejece la operación 2 días reescribiendo la marca de inicio (la cadena no es una firma).
-        reencadenar(res["manifiesto"], lambda regs: regs[0].__setitem__("t", regs[0]["t"] - 2 * DIA))
+        reencadenar(res["manifiesto"], lambda regs: regs[0].__setitem__("t", regs[0]["t"] - 2 * DIA),
+                    clave=aut.AlmacenSintetico.desde_hex(HEX_SINTETICA).activa())
         p = self.run_cli("purge", "--zona", self.zona, "--dias", "1", "--ejecutar")
         self.assertEqual(p.returncode, 0, p.stderr)
         r = json.loads(p.stdout)

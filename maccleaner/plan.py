@@ -6,8 +6,10 @@ recalculada. De cada fichero se guardan los metadatos necesarios para detectar c
 aplicar: st_dev, st_ino, propietario, modo, tamaño, mtime_ns, ctime_ns, birthtime y (opcional) SHA-256.
 
 `huella` es un SHA-256 del contenido canónico del plan: detecta modificaciones accidentales o ingenuas.
-NO es una firma autenticada: quien edite el plan puede recalcularla. Por eso `apply` vuelve a comprobar
-todas las protecciones y la zona sin fiarse del plan.
+F3: los planes de zona sintética (y, en el futuro, los reales) llevan además `autenticacion`, un HMAC-SHA256
+con clave del Llavero (autenticacion.py) que liga versión, id, zona, fechas, configuración y elementos.
+`apply` exige un MAC válido Y además vuelve a comprobar todas las protecciones sin fiarse del plan. Los planes
+sin zona (vista previa o sombra) no se autentican: nunca son aplicables.
 """
 from __future__ import annotations
 
@@ -20,13 +22,15 @@ import re
 import secrets
 import time
 
+from . import autenticacion as aut
 from . import zona as zona_mod
 from .config import Config
 from .escaner import DIA, Escaner, ref_antiguedad
 from .fsseguro import sha256_ruta
 from .sistema import FicherosAbiertos
 
-VERSION_PLAN = 1
+VERSION_PLAN = 2          # F3: v2 = con autenticación HMAC; los planes v1 (F2) se rechazan
+_ID_PLAN = re.compile(r"\d{8}-\d{6}-[0-9a-f]{6}")
 CADUCIDAD_ESCANEO_H = 24
 CADUCIDAD_PLAN_H = 24
 TOLERANCIA_FUTURO_S = 300
@@ -42,7 +46,7 @@ def _canon(d: dict) -> bytes:
 
 
 def calcular_huella(plan: dict) -> str:
-    return hashlib.sha256(_canon({k: v for k, v in plan.items() if k != "huella"})).hexdigest()
+    return hashlib.sha256(_canon({k: v for k, v in plan.items() if k not in ("huella", "autenticacion")})).hexdigest()
 
 
 def sha256_fichero(ruta: str) -> str:
@@ -52,7 +56,9 @@ def sha256_fichero(ruta: str) -> str:
 
 def crear_plan(escaneo: dict, cfg: Config, *, ruta_escaneo: str = "", ahora: float | None = None,
                abiertos: FicherosAbiertos | None = None, hash_max_bytes: int = 64 << 20,
-               calcular_hash: bool = True, caducidad_h: float = CADUCIDAD_PLAN_H) -> dict:
+               calcular_hash: bool = True, caducidad_h: float = CADUCIDAD_PLAN_H,
+               clave: aut.Clave | None = None, firmar: bool = True) -> dict:
+    """Con zona sintética el plan se firma con `clave` (por defecto, la activa del almacén actual)."""
     ahora = ahora or time.time()
     t_esc = float(escaneo.get("ahora", 0))
     if not t_esc:
@@ -67,6 +73,11 @@ def crear_plan(escaneo: dict, cfg: Config, *, ruta_escaneo: str = "", ahora: flo
     zona = escaneo.get("zona")
     if zona:
         zona = zona_mod.validar_zona(zona)
+        if firmar and clave is None:
+            try:
+                clave = aut.almacen_actual().activa()
+            except aut.ClaveNoDisponible as exc:
+                raise PlanNoValido(f"no se puede firmar el plan: {exc}") from exc
     esc = Escaner(cfg, abiertos=abiertos or FicherosAbiertos(), ahora=ahora, limite=zona)
     reglas = {r.id: r for r in cfg.reglas}
     elementos, excluidos = [], []
@@ -124,7 +135,7 @@ def crear_plan(escaneo: dict, cfg: Config, *, ruta_escaneo: str = "", ahora: flo
     plan = {
         "tipo": "mac-cleaner-plan", "version": VERSION_PLAN, "id": dt.datetime.fromtimestamp(ahora).strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(3),
         "creado": ahora, "caduca": ahora + caducidad_h * 3600,
-        "zona": zona, "modo": "sintetico" if zona else "real (solo vista previa: apply lo rechaza en F2)",
+        "zona": zona, "modo": "sintetico" if zona else "real (vista previa sin autenticar: apply la rechaza)",
         "home": cfg.home, "tmpdir": cfg.tmpdir,
         "config": cfg.origen, "config_sha256": sha256_fichero(cfg.origen),
         "escaneo": {"ruta": ruta_escaneo, "generado": escaneo.get("generado"), "ahora": t_esc},
@@ -136,6 +147,10 @@ def crear_plan(escaneo: dict, cfg: Config, *, ruta_escaneo: str = "", ahora: flo
         "nota_huella": "SHA-256 de integridad del contenido; no es una firma autenticada.",
     }
     plan["huella"] = calcular_huella(plan)
+    if zona and firmar:
+        aut.firmar_plan(plan, clave)
+    elif not firmar:
+        plan["modo"] = "sombra (sin autenticar: no aplicable)"
     return plan
 
 
@@ -190,7 +205,13 @@ def validar_plan(plan: dict, ahora: float | None = None) -> str:
         raise PlanNoValido("el plan ha caducado: vuelve a ejecutar `scan` y `plan`")
     if plan.get("zona") is not None and not isinstance(plan["zona"], str):
         raise PlanNoValido("«zona» debe ser texto")
-    zona = zona_mod.validar_zona(plan.get("zona"))   # sin zona → limpieza real deshabilitada
+    if not _ID_PLAN.fullmatch(plan["id"]):
+        raise PlanNoValido("identificador de plan no válido")
+    zona = zona_mod.validar_zona(plan.get("zona"))   # sin zona → limpieza real deshabilitada (primera barrera)
+    try:
+        aut.verificar_plan(plan)                     # F3: MAC HMAC-SHA256 con la clave declarada
+    except aut.ErrorAutenticacion as exc:
+        raise PlanNoValido(f"autenticación: {exc}") from exc
     vistos_ruta, vistos_id, vistos_ino = set(), set(), set()
     for e in plan["elementos"]:
         if not isinstance(e, dict):

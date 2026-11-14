@@ -13,6 +13,12 @@ Concurrencia (F2.5): apply, restore y purge toman un bloqueo exclusivo (flock) d
 la operación y recargan su contenido después de obtenerlo. Además, `anotar` comprueba que el fichero tiene
 exactamente el tamaño que este objeto escribió o leyó: si otro proceso añadió registros, se niega a escribir
 en lugar de romper la cadena. El manifiesto nunca se abre siguiendo enlaces simbólicos.
+
+Autenticación (F3): si el manifiesto se crea con una clave, el registro `inicio` declara `autenticacion`
+(algoritmo e id de clave) y CADA registro lleva `mac` = HMAC-SHA256 ligado a la operación (autenticacion.py).
+Al cargar se exige la clave y se verifican todos los MAC; un manifiesto sin autenticación (formato F2) o con
+un MAC inválido se rechaza. Solo `restore --recuperacion-sin-clave` puede cargarlo sin verificar los MAC
+(cadena, inodos y SHA-256 sí se comprueban), y lo que anota en ese modo queda marcado como `recuperacion`.
 """
 from __future__ import annotations
 
@@ -24,11 +30,20 @@ import os
 import stat
 import time
 
+from . import autenticacion as aut
+
 CERO = "0" * 64
 
 
 class ManifiestoCorrupto(ValueError):
     pass
+
+
+class ManifiestoNoAutenticado(ManifiestoCorrupto):
+    """Falta la autenticación, la clave no está disponible o un MAC no es válido."""
+
+
+FORMATO = "mac-cleaner-manifiesto/2"
 
 
 class ManifiestoOcupado(RuntimeError):
@@ -52,10 +67,13 @@ def _huella(prev: str, reg: dict) -> str:
 
 
 class Manifiesto:
-    def __init__(self, ruta: str, registros: list[dict] | None = None, tam: int = 0):
+    def __init__(self, ruta: str, registros: list[dict] | None = None, tam: int = 0,
+                 clave: aut.Clave | None = None, recuperacion: bool = False):
         self.ruta = ruta
         self.registros = registros or []
         self._tam = tam            # bytes del fichero que este objeto conoce (leídos o escritos)
+        self.clave = clave
+        self.recuperacion = recuperacion
 
     @property
     def ultimo(self) -> str:
@@ -63,7 +81,12 @@ class Manifiesto:
 
     def anotar(self, evento: str, **datos) -> dict:
         reg = {"n": len(self.registros), "t": time.time(), "evento": evento, "prev": self.ultimo, **datos}
+        if self.recuperacion:
+            reg["recuperacion"] = True          # anotado sin clave: no lleva MAC
         reg["h"] = _huella(reg["prev"], {k: v for k, v in reg.items() if k != "h"})
+        if self.clave is not None:
+            op = reg["op"] if evento == "inicio" else self.inicio["op"]
+            reg["mac"] = aut.mac_registro(self.clave, op, reg)
         linea = (json.dumps(reg, ensure_ascii=False, sort_keys=True) + "\n").encode()
         # Ruta absoluta (la guardia la comprueba) y O_NOFOLLOW: un enlace en lugar del manifiesto da ELOOP.
         fd = os.open(self.ruta, os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW)
@@ -85,15 +108,18 @@ class Manifiesto:
         return reg
 
     @classmethod
-    def crear(cls, ruta: str, **inicio) -> "Manifiesto":
+    def crear(cls, ruta: str, clave: aut.Clave | None = None, **inicio) -> "Manifiesto":
         fd = os.open(ruta, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         os.close(fd)
-        m = cls(ruta)
+        if clave is not None:
+            inicio["autenticacion"] = {"alg": aut.ALG, "id_clave": clave.id, "formato": FORMATO}
+        m = cls(ruta, clave=clave)
         m.anotar("inicio", **inicio)
         return m
 
     @classmethod
-    def cargar(cls, ruta: str) -> "Manifiesto":
+    def cargar(cls, ruta: str, *, verificar: bool = True, almacen=None) -> "Manifiesto":
+        """verificar=False SOLO para la recuperación sin clave: comprueba la cadena, no los MAC."""
         regs, prev = [], CERO
         try:
             fd = _abrir_lectura(ruta)
@@ -109,7 +135,7 @@ class Manifiesto:
                 raise ManifiestoCorrupto(f"línea {i + 1} no es JSON válido") from exc
             if reg.get("n") != i or reg.get("prev") != prev:
                 raise ManifiestoCorrupto(f"cadena rota en la línea {i + 1} (orden o registro anterior alterado)")
-            if _huella(prev, {k: v for k, v in reg.items() if k != "h"}) != reg.get("h"):
+            if _huella(prev, {k: v for k, v in reg.items() if k not in ("h", "mac")}) != reg.get("h"):
                 raise ManifiestoCorrupto(f"huella no válida en la línea {i + 1} (registro modificado)")
             regs.append(reg)
             prev = reg["h"]
@@ -117,7 +143,25 @@ class Manifiesto:
             raise ManifiestoCorrupto("el manifiesto no empieza por un registro de inicio")
         if not datos.endswith(b"\n"):
             raise ManifiestoCorrupto("el manifiesto termina en una línea incompleta")
-        return cls(ruta, regs, tam=len(datos))
+        if not verificar:
+            return cls(ruta, regs, tam=len(datos), recuperacion=True)
+        a = regs[0].get("autenticacion")
+        if not isinstance(a, dict) or a.get("alg") != aut.ALG or a.get("formato") != FORMATO:
+            raise ManifiestoNoAutenticado("manifiesto sin autenticación HMAC (formato F2 o alterado): "
+                                          "solo se puede restaurar con --recuperacion-sin-clave")
+        try:
+            clave = (almacen or aut.almacen_actual()).obtener(str(a.get("id_clave")))
+        except aut.ClaveNoDisponible as exc:
+            raise ManifiestoNoAutenticado(f"{exc}: sin la clave no se puede autenticar el manifiesto "
+                                          "(ver «Pérdida de clave» en docs/SEGURIDAD-F3.md)") from exc
+        op = regs[0].get("op")
+        if not isinstance(op, str):
+            raise ManifiestoNoAutenticado("el registro de inicio no identifica la operación")
+        for i, reg in enumerate(regs):
+            if not aut.verificar_registro(clave, op, reg):
+                raise ManifiestoNoAutenticado(f"MAC no válido en la línea {i + 1}: registro alterado, de otra "
+                                              "operación o anotado sin clave")
+        return cls(ruta, regs, tam=len(datos), clave=clave)
 
     @contextlib.contextmanager
     def bloquear(self):
@@ -133,11 +177,16 @@ class Manifiesto:
             except BlockingIOError as exc:
                 raise ManifiestoOcupado("la operación está ocupada por otro proceso (apply, restore o purge)") from exc
             if os.fstat(fd).st_size != self._tam:
-                fresco = Manifiesto.cargar(self.ruta)
+                fresco = Manifiesto.cargar(self.ruta, verificar=not self.recuperacion,
+                                           almacen=_AlmacenFijo(self.clave) if self.clave else None)
                 self.registros, self._tam = fresco.registros, fresco._tam
             yield self
         finally:
             os.close(fd)                 # cerrar el descriptor libera el flock
+
+    @property
+    def autenticado(self) -> bool:
+        return self.clave is not None
 
     # ── consultas ──
     @property
@@ -176,3 +225,15 @@ class Manifiesto:
                 # automáticamente; requiere revisión manual.
                 e.update(estado="retenido", retenido_en=r.get("destino"), motivo=r.get("motivo"))
         return est
+
+
+class _AlmacenFijo:
+    """Recarga con la misma clave con la que se cargó el manifiesto."""
+
+    def __init__(self, clave: aut.Clave):
+        self.clave = clave
+
+    def obtener(self, cid: str) -> aut.Clave:
+        if cid != self.clave.id:
+            raise aut.ClaveNoDisponible(f"la clave {cid} no es la del manifiesto")
+        return self.clave
