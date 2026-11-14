@@ -171,12 +171,40 @@ def cmd_apply(a: argparse.Namespace) -> int:
 
 def cmd_restore(a: argparse.Namespace) -> int:
     from .manifiesto import ManifiestoCorrupto, ManifiestoOcupado
-    from .restaurar import ErrorRestauracion, restaurar
+    from .restaurar import ErrorRestauracion, inventario_recuperacion, restaurar, restaurar_recuperacion
     try:
         zona = zona_mod.validar_zona(a.zona)
         guardia.activar(zona)
-        res = restaurar(zona, a.operacion, elemento=a.elemento, ruta=a.ruta, sin_clave=a.recuperacion_sin_clave)
-    except (zona_mod.ZonaNoValida, ManifiestoCorrupto, ManifiestoOcupado, ErrorRestauracion) as exc:
+        if not a.recuperacion_sin_clave:
+            if a.confirmar or a.codigo:
+                raise ErrorRestauracion("--confirmar y --codigo solo valen con --recuperacion-sin-clave")
+            res = restaurar(zona, a.operacion, elemento=a.elemento, ruta=a.ruta)
+        elif not a.confirmar:
+            # Paso 1: inventario de solo lectura. No se mueve nada.
+            inv = inventario_recuperacion(zona, a.operacion)
+            salida = os.path.join(zona, "informes")
+            os.makedirs(salida, exist_ok=True)
+            ruta = os.path.join(salida, f"recuperacion-{a.operacion}-{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}.json")
+            with open(ruta, "w", encoding="utf-8") as fh:
+                json.dump(inv, fh, ensure_ascii=False, indent=1)
+            n = sum(1 for e in inv["elementos"] if e["clasificacion"] == "restaurable")
+            print(inv["aviso"])
+            for e in inv["elementos"]:
+                print(f"  [{e['clasificacion']:11}] {e['id']} → {e['origen']}" + (f"  ({e['motivo']})" if e["motivo"] else ""))
+            for h in inv["huerfanos"]:
+                print(f"  [huérfano   ] {h} (no figura en el manifiesto: revisión manual)")
+            print(f"No se ha movido nada. Restaurables: {n}; ambiguos: {len(inv['elementos']) - n} (se quedan en cuarentena).")
+            print(f"Inventario: {ruta}")
+            print(f"Código: {inv['codigo']}  (válido 1 h; para confirmar: --confirmar INVENTARIO --codigo CÓDIGO)")
+            return 0
+        else:
+            with open(a.confirmar, encoding="utf-8") as fh:
+                inv = json.load(fh)
+            res = restaurar_recuperacion(zona, a.operacion, inv, a.codigo or "",
+                                         elementos={a.elemento} if a.elemento else None)
+            print(json.dumps(res, ensure_ascii=False, indent=1))
+            return 0 if not res["errores"] else 1
+    except (zona_mod.ZonaNoValida, ManifiestoCorrupto, ManifiestoOcupado, ErrorRestauracion, OSError, ValueError) as exc:
         print(f"restore rechazado: {exc}", file=sys.stderr)
         return 2
     print(json.dumps(res, ensure_ascii=False, indent=1))
@@ -348,7 +376,10 @@ def main(argv: list[str] | None = None) -> int:
     rs.add_argument("--elemento", help="Id del elemento (p. ej. e000003)")
     rs.add_argument("--ruta", help="Ruta original del elemento")
     rs.add_argument("--recuperacion-sin-clave", action="store_true",
-                    help="Clave perdida: restaurar sin verificar los MAC (cadena, inodo y SHA-256 sí se comprueban)")
+                    help="Clave perdida: genera un inventario de solo lectura (no mueve nada); con --confirmar y "
+                         "--codigo restaura SOLO lo «restaurable» revisado")
+    rs.add_argument("--confirmar", help="Inventario de recuperación revisado (JSON del paso anterior)")
+    rs.add_argument("--codigo", help="Código impreso con el inventario")
     rs.set_defaults(func=cmd_restore)
 
     pu = sub.add_parser("purge", help="Lista (o, con --ejecutar, borra en zona sintética) lo caducado en cuarentena")

@@ -1,6 +1,6 @@
 # mac-cleaner F3 · Autenticación, lista blanca y modo sombra
 
-Estado (14-11-2026): F3 prepara la limpieza real, pero **no la habilita**. `zona.LIMPIEZA_REAL_HABILITADA = False`
+Estado (14-11-2026, revisado en la auditoría F3.5, §10): F3 prepara la limpieza real, pero **no la habilita**. `zona.LIMPIEZA_REAL_HABILITADA = False`
 y la puerta de zona de `plan.validar_plan` siguen siendo la primera barrera: `apply`, `restore` y `purge` solo
 actúan en zonas sintéticas. Nada de lo descrito aquí es una garantía absoluta; los riesgos abiertos están en §7.
 
@@ -37,6 +37,7 @@ actúan en zonas sintéticas. Nada de lo descrito aquí es una garantía absolut
   - Una entrada por clave, con cuenta = `id_clave` (`k-<16 hex>`) y 32 bytes aleatorios.
   - Una entrada `indice` con la clave activa y la lista de claves con su fecha de creación. Es información no secreta.
 - **Acceso**: con la API de Security.framework mediante `ctypes`. No usa subprocesos y el secreto nunca pasa por `argv`, el entorno, ficheros, registros ni informes.
+- **Control de acceso (F3.5)**: cada clave se crea con una lista de aplicaciones de confianza **vacía**. Toda lectura muestra el diálogo del sistema y exige tu confirmación, también para el Python que la creó. mac-cleaner guarda la clave en memoria tras la primera lectura, así que hay un diálogo por proceso y clave. Responde **«Permitir»**, nunca «Permitir siempre»: esa opción añadiría ese Python a la lista y cualquier script ejecutado con él volvería a leer la clave sin preguntar. El índice no es secreto y conserva la ACL por defecto.
 - **Representación**: `Clave.__repr__` no muestra el secreto. Los planes y manifiestos solo guardan `id_clave`.
 - **Creación**: ninguna orden crea la clave por su cuenta. La crea el usuario con `mac-cleaner clave crear`. F3 no ha creado ninguna (`clave estado` → `activa: null`).
 
@@ -64,21 +65,50 @@ actúan en zonas sintéticas. Nada de lo descrito aquí es una garantía absolut
 `clave rotar` crea una clave nueva y la marca como activa. **Las anteriores se conservan** para que las operaciones
 que firmaron sigan siendo verificables, restaurables y purgables. Los planes nuevos se firman con la clave nueva.
 
-### 3.3 Pérdida de la clave
+### 3.3 Pérdida de la clave: recuperación con intervención manual (F3.5)
 
-Por ejemplo, si se borra la entrada del Llavero o el Llavero se restablece.
+Por ejemplo, si se borra la entrada del Llavero, el Llavero se restablece o se deniega el acceso.
 
 - **Planes pendientes**: dejan de ser aplicables. Hay que volver a ejecutar `scan` y `plan` con una clave nueva.
-- **Operaciones en cuarentena**: sus manifiestos ya no se pueden autenticar.
-  - `purge` **no las toca nunca**: nada se borra sin MAC válidos.
-  - `restore --recuperacion-sin-clave` las restaura comprobando la cadena SHA-256, la coherencia origen/destino, el inodo, los metadatos y el SHA-256 o el ctime, sin sobrescribir y solo dentro de la zona. Lo que anota queda marcado como `recuperacion`.
-- **Después**: `clave crear` (si no queda índice) o `clave rotar`.
+- **Operaciones en cuarentena**: sus manifiestos ya no se pueden autenticar. `purge` **no las toca nunca**.
+
+Sin la clave, el manifiesto **no prueba nada**: su cadena SHA-256 no tiene clave y quien pueda escribir en la cuarentena puede recalcularla. Por eso no hay restauración automática:
+
+1. **Inventario, de solo lectura**: `restore --zona ZONA --operacion OP --recuperacion-sin-clave` no mueve ni escribe nada en la cuarentena. Clasifica cada elemento:
+   - **restaurable**: solo si todas las fuentes coinciden:
+     - la ruta en la cuarentena es `archivos/<ruta relativa del origen>`;
+     - el origen está en la zona, normalizado y fuera de la cuarentena;
+     - el inodo, el tamaño, la mtime, el modo y el propietario son los del manifiesto;
+     - el SHA-256 coincide o, si no lo hay, el ctime;
+     - el destino está libre y su directorio padre no es un enlace.
+   - **ambiguo**: cualquier discrepancia, con su motivo.
+
+   Lista también los ficheros de la cuarentena que el manifiesto no menciona («huérfanos»). Guarda el inventario en `ZONA/informes/recuperacion-OP-….json`, con el SHA-256 actual de cada fichero y un **código** de 12 caracteres ligado a su contenido.
+2. **Revisión humana**: compruebas cada origen restaurable. Que sea restaurable indica coherencia, no autenticidad.
+3. **Confirmación**: `restore … --recuperacion-sin-clave --confirmar INVENTARIO --codigo CÓDIGO [--elemento ID]`.
+   - **Se rechaza** si el código no corresponde al inventario, si el inventario tiene más de 1 h o si el manifiesto cambió desde que se generó.
+   - **Solo mueve lo restaurable**, y antes vuelve a comprobarlo todo y exige que el SHA-256 y el inodo sean los del inventario. Lo que haya cambiado se omite.
+   - **Nunca sobrescribe** (`RENAME_EXCL`), y lo ambiguo y lo huérfano se quedan en la cuarentena.
+   - **No escribe en el manifiesto**: anota en `<op>/recuperacion.jsonl`. Si la clave reaparece, por ejemplo al restaurar una copia del Llavero, el manifiesto sigue siendo verificable y `restore` normal termina el resto.
+4. **Lo ambiguo**: se revisa a mano en `ZONA/.mac-cleaner-cuarentena/<op>/archivos/`, que replica las rutas originales.
+
+**Después**: `clave crear` (si no queda índice) o `clave rotar`.
 
 ### 3.4 Compromiso de la clave (sospecha de que otro proceso la leyó)
 
 1. `clave rotar`, para que los planes nuevos usen otra clave.
 2. Restaurar o revisar las operaciones firmadas con la clave comprometida.
-3. Borrar a mano su entrada en «Acceso a Llaveros» (servicio `mac-cleaner.hmac`, cuenta = id). A partir de ahí, esas operaciones solo se pueden recuperar sin clave.
+3. Borrar a mano su entrada en «Acceso a Llaveros» (servicio `mac-cleaner.hmac`, cuenta = id). A partir de ahí, esas operaciones solo se pueden recuperar con el procedimiento manual de §3.3.
+
+### 3.4 bis Llavero bloqueado o sesión cerrada
+
+Con el Llavero bloqueado, o sin sesión gráfica (cierre de sesión, SSH o un trabajo de launchd sin sesión), la lectura falla. Hay tres códigos posibles:
+
+- -25293: denegado o bloqueado;
+- -25308: hace falta interacción y no la hay;
+- -128: cancelado.
+
+mac-cleaner lo traduce a `ClaveNoDisponible`, de modo que no se puede firmar un plan ni verificar uno, y no hay ninguna operación destructiva. Es coherente con la regla de no ejecutar `apply` desatendido.
 
 Retirar claves desde la CLI queda pendiente.
 
@@ -149,10 +179,10 @@ Hoy la lista blanca **solo clasifica**: `apply` no puede operar sobre datos real
 
 **Riesgos y limitaciones:**
 
-- **Acceso a la clave**: la entrada del Llavero la crea el intérprete de Python que ejecuta mac-cleaner. Cualquier script que corra con **ese mismo intérprete** y tu usuario puede leerla sin aviso; otras aplicaciones verían el diálogo del Llavero. HMAC protege frente a la manipulación de ficheros, no frente a código malicioso ejecutado como tú.
+- **Acceso a la clave (mitigado en F3.5)**: con confirmación obligatoria, ningún proceso la lee sin el diálogo. Pero el diálogo solo identifica al intérprete («python3.15»), no al script. Un script malicioso que lo provoque a la vez que tú usas mac-cleaner es indistinguible. Si se elige «Permitir siempre», se vuelve a la situación de F3. Además, la clave queda en la memoria del proceso: los `bytes` de Python no se pueden borrar de forma fiable.
 - **API clásica**: el acceso al Llavero usa la API clásica (`SecKeychain*`), obsoleta pero presente en macOS 26. Si desaparece, habrá que migrar a `SecItem*`.
 - **Final del manifiesto**: un final truncado sigue sin detectarse con la cadena ni con los MAC. Por eso existe el registro `cierre`, y `purge` no toca operaciones sin él.
-- **Recuperación sin clave**: confía en la cadena, que no tiene clave. Un atacante que recalcule la cadena **y** mueva los ficheros dentro de la cuarentena para que origen y destino sigan siendo coherentes podría redirigir una restauración dentro de la zona. Nunca sobrescribe.
+- **Recuperación sin clave (rediseñada en F3.5)**: ya no hay restauración automática. Un atacante que escriba en la cuarentena puede seguir fabricando un elemento «restaurable» coherente, pero solo se moverá si tú lo confirmas tras revisar el inventario. Nunca sobrescribe y nunca sale de la zona.
 - **Lista blanca**: aún no está conectada a `apply` (§5).
 - **Sombra**: usa una instantánea de lsof y muestras de rutas, no la lista completa de ficheros.
 - **Heredados de F2.5**: los riesgos de `docs/SEGURIDAD-F2.md` §6 y §8.3 siguen vigentes, salvo la falta de autenticación, que F3 resuelve.
@@ -187,7 +217,7 @@ Ningún paso está hecho. Cada uno requiere una decisión expresa del usuario.
 
 ## 9. Pruebas
 
-`tests/test_f3.py`, 25 pruebas:
+`tests/test_f3.py`, 25 pruebas (F3.5 adaptó 4 a la recuperación en dos pasos y al Llavero simulado; `tests/test_f35.py` añade 19 más, ver §10):
 
 - planes alterados, MAC ausente o manipulado, clave incorrecta o ausente, planes v1, clave sintética sobre datos reales y plan de otra zona;
 - reproducción en serie y en paralelo, registros de otra operación y manifiesto copiado;
@@ -206,3 +236,80 @@ Ningún paso está hecho. Cada uno requiere una decisión expresa del usuario.
 - La prueba de reproducción espera ahora el rechazo de la reserva.
 - La prueba de manifiesto forjado recalcula también los MAC.
 - Dos pruebas excluyen el directorio `planes-aplicados` al buscar la operación.
+
+## 10. Auditoría F3.5 (14-11-2026)
+
+**Alcance**: `autenticacion.py` (Llavero y HMAC), `manifiesto.py`, `plan.py`, `restaurar.py` (recuperación) y
+`purgar.py`.
+
+**Método**: pruebas adversariales con claves sintéticas, almacenes simulados y zonas sintéticas
+(`tests/test_f35.py`). Cada defecto se reprodujo sobre el commit de F3 `b31acbe` en un *worktree* temporal. Para el
+Llavero se hicieron experimentos con un **Llavero temporal** en un directorio temporal: clave sintética, interacción
+desactivada y sin entrar en la lista de búsqueda (comprobado antes y después). No se crearon, rotaron ni borraron
+claves reales.
+
+### 10.1 Evidencia del Llavero
+
+| Experimento (Llavero temporal) | Resultado |
+|---|---|
+| Elemento con ACL por defecto (como F3), leído por el mismo Python sin interacción | `0`: **se lee sin confirmación** |
+| ACL de ese elemento (`security dump-keychain -a`) | `decrypt`: solo `…/Cellar/python@3.15/3.15.2/…/Python.app`, ligado a esa versión concreta |
+| Otro ejecutable (`/usr/bin/security find-generic-password -w`) | Se queda esperando la confirmación del usuario |
+| Elemento con lista de confianza **vacía** (corrección F3.5), leído sin interacción | `-25293`: denegado. ACL `decrypt: applications (0)` |
+| Llavero bloqueado, lectura sin interacción | `-25293`: denegado |
+| Prueba opcional `test_llavero_temporal_real_exige_confirmacion` (código real de F3.5) | La clave no se lee sin confirmación; el índice no secreto sí |
+
+**Incidencia durante la auditoría**: el experimento con `/usr/bin/security` se lanzó al principio sin desactivar la
+interacción y mostró un diálogo del sistema que pedía la contraseña del Llavero temporal. Se canceló y el Llavero
+temporal se borró; no afectó al Llavero de inicio de sesión. El resto de experimentos se hicieron solo desde Python
+y con la interacción desactivada.
+
+**Conclusiones sobre el Llavero:**
+
+- **Quién puede leer la clave**:
+  - Con la ACL por defecto de F3, el Python que la creó, y con él cualquier script ejecutado con ese mismo Python, la leía sin confirmación.
+  - Con la de F3.5, nadie la lee sin el diálogo. «Permitir siempre» lo anularía.
+- **Restringir a un ejecutable**: es posible (`SecTrustedApplicationCreateFromPath`), pero inútil con un intérprete, porque autorizaría a todos sus scripts.
+- **Actualizaciones de Python**: la entrada de confianza apunta a la ruta de Cellar de una versión concreta. Tras `brew upgrade`, una ACL que la incluyera dejaría de coincidir y volvería a preguntar. Con la lista vacía no hay nada que se rompa: siempre pregunta.
+- **Alternativas nativas más fuertes**: el Llavero de protección de datos con `kSecAttrAccessControl`, que pide presencia del usuario o Touch ID, exige una aplicación firmada con el *entitlement* `keychain-access-groups`. Un script con el Python de Homebrew no puede usarlo. Para F4 o después, un ayudante firmado mínimo que custodie la clave y firme o verifique.
+- **Llavero bloqueado o sesión cerrada**: no se puede leer la clave y no hay operación (§3.4 bis).
+- **Ciclo de vida**: creación y rotación con lista vacía y caché por proceso. Las claves antiguas se conservan para verificar. La retirada es manual (§3.4). La pérdida se gestiona con §3.3.
+
+### 10.2 Hallazgos y correcciones
+
+| # | Tipo | Gravedad | Hallazgo y evidencia | Corrección | Prueba |
+|---|---|---|---|---|---|
+| V1 | Vulnerabilidad | Alta | `--recuperacion-sin-clave` restauraba **automáticamente** según un manifiesto sin autenticar: tomaba una cadena SHA-256 sin clave como prueba de identidad. En F3, `restaurar(…, sin_clave=True)` movió ficheros sin ninguna revisión | Recuperación en dos pasos: inventario de solo lectura, luego confirmación con código, caducidad de 1 h y manifiesto sin cambios. Lo ambiguo se queda en la cuarentena | `test_sin_confirmacion_no_se_mueve_nada`, `test_rutas_manipuladas_quedan_en_cuarentena`, `test_conflicto_y_sustitucion_tras_el_inventario`, `test_inventario_caducado_alterado_o_de_otro_estado`, `test_cli_recuperacion_en_dos_pasos` |
+| V2 | Robustez | Media | La recuperación añadía registros **sin MAC** al manifiesto. Si la clave reaparecía, el manifiesto ya no se autenticaba: en F3 dio «MAC no válido en la línea 11» y bloqueó el resto de la operación | La recuperación no escribe en el manifiesto (`recuperacion.jsonl` aparte); los manifiestos cargados sin verificar son de solo lectura | `test_recuperacion_no_contamina_el_manifiesto` |
+| V3 | Robustez | Media | Una caída a mitad de escribir un registro dejaba una línea incompleta y el manifiesto entero se rechazaba, también en recuperación: la operación no se podía restaurar con la herramienta | La cola incompleta se ignora al cargar. No se escribe detrás de ella. `restore` la recorta bajo bloqueo y anota `cola_descartada` con su tamaño y SHA-256. `purge` no toca esas operaciones | `test_registro_final_incompleto_no_impide_restaurar`, `test_operacion_con_cola_incompleta_o_descartada_no_se_purga`, `test_no_se_escribe_detras_de_una_linea_incompleta` |
+| V4 | Vulnerabilidad | Media-alta | Clave del Llavero legible sin confirmación por el Python que la creó y sus scripts (§10.1) | ACL con lista de confianza vacía, caché por proceso y errores del Llavero explicados | `test_claves_creadas_con_confirmacion_obligatoria_y_cache`, `test_errores_del_llavero_explicados`, `test_llavero_temporal_real_exige_confirmacion` (opcional) |
+
+### 10.3 Verificado sin defecto (con prueba)
+
+- **Canonicalización**:
+  - JSON con claves ordenadas y separadores fijos, calculado sobre el objeto ya interpretado: las claves duplicadas o los espacios no cambian la semántica firmada.
+  - Separación de dominios plan/manifiesto y contexto de operación.
+  - Los identificadores de clave se validan antes de usarse.
+- **Tipos y campos**: se validan después del MAC. Un MAC válido no exime de las comprobaciones (pruebas de F2.5 y F3).
+- **Registros eliminados o reordenados**: se rechazan. Un MAC inválido impide `restore` y `purge` (`TestRegistrosAlterados`).
+- **Truncar el final** con registros completos no se detecta, pero **no habilita nada destructivo**:
+  - quitar el `cierre` bloquea la purga;
+  - quitar los `restaurado` no permite borrar nada, porque lo restaurado ya no está en la cuarentena (`TestTruncamiento`).
+- **Reproducción de planes**, de serie o en paralelo, y **acceso concurrente**: incluida la recuperación con la operación ocupada (`test_recuperacion_con_operacion_ocupada`).
+- **Separación sintético/real**: un plan real firmado con una clave **no** sintética es criptográficamente válido, pero la puerta de zona lo rechaza. `restore`, `purge` y la recuperación rechazan el HOME, `/private/tmp` y directorios sin marcador (`TestOperacionesReales`).
+
+### 10.4 Riesgos residuales
+
+- **Diálogo del Llavero**: no distingue mac-cleaner de otro script con el mismo Python, y «Permitir siempre» anula la protección.
+- **Clave en memoria**: queda en la memoria del proceso mientras se ejecuta.
+- **Truncar el final del manifiesto**: sigue sin detectarse. Su efecto se limita a operaciones no destructivas (analizado arriba).
+- **Recuperación sin clave**: depende de la revisión humana del inventario.
+- **API clásica del Llavero**: obsoleta.
+
+### 10.5 Condiciones para pasar a F4
+
+1. Las pruebas pasan, incluida la opcional del Llavero temporal ejecutada a mano.
+2. El usuario crea la clave (`clave crear`) y comprueba que el diálogo aparece en `plan` y `apply`.
+3. Siete días de `sombra` a mano, sin sorpresas (§8).
+4. Autorización escrita (reglas, topes, cuarentena y retención) y revisión del cambio de código de F4: lista blanca en `apply`, clave no sintética obligatoria y puerta de zona para todo lo demás.
+5. Decisión sobre el ayudante firmado (§10.1) o aceptación expresa del riesgo residual del diálogo.

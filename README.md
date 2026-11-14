@@ -3,8 +3,8 @@
 Alternativa propia a las funciones de limpieza de CleanMyMac, basada en la investigación REA-004
 (informe y evidencias locales, no versionados: contienen metadatos de binarios propietarios y datos del equipo).
 
-**Estado: F3** (14-11-2026): preparación para la limpieza real, que **sigue deshabilitada**. F2.5 (auditoría) en
-`docs/SEGURIDAD-F2.md` §8; F3 (HMAC, lista blanca npm/pip, modo sombra) en `docs/SEGURIDAD-F3.md`.
+**Estado: F3, auditada en F3.5** (14-11-2026): preparación para la limpieza real, que **sigue deshabilitada**. F2.5 (auditoría) en
+`docs/SEGURIDAD-F2.md` §8; F3 (HMAC, lista blanca npm/pip, modo sombra) y F3.5 (Llavero, recuperación manual) en `docs/SEGURIDAD-F3.md`.
 - F1 (`scan`, `report`) es de solo lectura y funciona sobre el Mac real.
 - F3 (`sombra`, `clave`) firma planes y manifiestos con HMAC-SHA256 (clave en el Llavero), define una lista blanca
   limitada a las cachés regenerables de npm (`_cacache`) y pip (`http-v2`, `http`) y evalúa en sombra qué se
@@ -44,11 +44,13 @@ Alternativa propia a las funciones de limpieza de CleanMyMac, basada en la inves
 ./mac-cleaner clave estado                 # id de la clave activa (nunca el secreto)
 ./mac-cleaner clave crear                  # SOLO por decisión del usuario: crea la clave HMAC en el Llavero
 ./mac-cleaner clave rotar                  # nueva clave activa; las antiguas siguen verificando sus operaciones
-./mac-cleaner restore --zona ZONA --operacion OP --recuperacion-sin-clave   # clave perdida (ver SEGURIDAD-F3 §3.3)
+./mac-cleaner restore --zona ZONA --operacion OP --recuperacion-sin-clave   # clave perdida: inventario, no mueve nada
+./mac-cleaner restore --zona ZONA --operacion OP --recuperacion-sin-clave --confirmar INVENTARIO --codigo CÓDIGO
 ```
 
 `plan` y `apply` en zona sintética necesitan una clave: la del Llavero o, en pruebas, `MAC_CLEANER_CLAVE_SINTETICA`
 (64 dígitos hexadecimales; una clave sintética nunca autoriza datos reales). `demo` usa una clave sintética efímera.
+Las claves del Llavero exigen confirmación en cada proceso: responde «Permitir», no «Permitir siempre» (SEGURIDAD-F3 §2.2).
 
 Una zona sintética es un directorio bajo `$TMPDIR` o `/private/tmp` con el marcador
 `.mac-cleaner-zona-sintetica` (lo crea `zona.crear_zona()` o `demo`), con `home/` y `tmp/` ficticios dentro.
@@ -125,11 +127,18 @@ Para cada grupo (primer componente bajo la raíz) el informe da:
 ## Pruebas
 
 ```bash
-/opt/homebrew/bin/python3 -B -m unittest discover -s tests -v    # 92 pruebas, ~7 s
+/opt/homebrew/bin/python3 -B -m unittest discover -s tests -v    # 111 pruebas (1 opcional), ~10 s
+MAC_CLEANER_PRUEBA_LLAVERO_TEMPORAL=1 …   # incluye la prueba con un Llavero temporal (sin diálogos)
 ```
 
-Son 92 pruebas: 16 de F1 (`tests/test_escaner.py`), 31 de F2 (`tests/test_f2.py`), 20 de la auditoría F2.5
-(`tests/test_f25.py`) y 25 de F3 (`tests/test_f3.py`). Ninguna toca el Llavero real: usan claves sintéticas en memoria.
+Son 111 pruebas: 16 de F1 (`tests/test_escaner.py`), 31 de F2 (`tests/test_f2.py`), 20 de la auditoría F2.5
+(`tests/test_f25.py`), 25 de F3 (`tests/test_f3.py`) y 19 de la auditoría F3.5 (`tests/test_f35.py`; una es
+opcional). Ninguna toca el Llavero real: usan claves sintéticas en memoria o, la opcional, un Llavero temporal.
+
+**F3.5** cubre: manifiestos con la última línea incompleta, final truncado y sin cierre, registros eliminados o
+reordenados, firmas inválidas, recuperación sin clave en dos pasos (rutas manipuladas, conflictos, sustitución tras el
+inventario, inventario caducado o alterado, operación ocupada, sin contaminar el manifiesto, por la CLI), planes reales
+firmados con una clave no sintética, `restore` y `purge` fuera de zonas sintéticas y el control de acceso del Llavero.
 
 **F3** cubre: planes y manifiestos alterados (con la huella recalculada), MAC ausente o manipulado, clave incorrecta,
 ausente, perdida o rotada, planes v1, clave sintética sobre datos reales, plan de otra zona, reproducción en serie y en

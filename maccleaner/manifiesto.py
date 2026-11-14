@@ -17,8 +17,13 @@ en lugar de romper la cadena. El manifiesto nunca se abre siguiendo enlaces simb
 Autenticación (F3): si el manifiesto se crea con una clave, el registro `inicio` declara `autenticacion`
 (algoritmo e id de clave) y CADA registro lleva `mac` = HMAC-SHA256 ligado a la operación (autenticacion.py).
 Al cargar se exige la clave y se verifican todos los MAC; un manifiesto sin autenticación (formato F2) o con
-un MAC inválido se rechaza. Solo `restore --recuperacion-sin-clave` puede cargarlo sin verificar los MAC
-(cadena, inodos y SHA-256 sí se comprueban), y lo que anota en ese modo queda marcado como `recuperacion`.
+un MAC inválido se rechaza. Solo la recuperación sin clave (restaurar.inventario_recuperacion) lo carga sin
+verificar los MAC, y NUNCA escribe en él (F3.5: lleva su propio registro, recuperacion.jsonl).
+
+Registro final incompleto (F3.5): una caída a mitad de escribir deja una última línea sin «\n». Esa cola se
+ignora al cargar (equivale a «el registro no llegó a escribirse», que el protocolo de escritura anticipada ya
+contempla), no se escribe nada detrás de ella y `reparar_cola()` (con la operación bloqueada) la recorta y
+anota `cola_descartada` con su tamaño y SHA-256. purge no toca operaciones con cola incompleta o descartada.
 """
 from __future__ import annotations
 
@@ -74,12 +79,18 @@ class Manifiesto:
         self._tam = tam            # bytes del fichero que este objeto conoce (leídos o escritos)
         self.clave = clave
         self.recuperacion = recuperacion
+        self._cola = b""           # bytes de una última línea incompleta (caída a mitad de escritura)
 
     @property
     def ultimo(self) -> str:
         return self.registros[-1]["h"] if self.registros else CERO
 
     def anotar(self, evento: str, **datos) -> dict:
+        if self._cola:
+            raise ManifiestoCorrupto("el manifiesto termina en un registro incompleto: hay que repararlo "
+                                     "(reparar_cola) antes de escribir")
+        if self.recuperacion:
+            raise ManifiestoCorrupto("un manifiesto cargado sin verificar los MAC es de solo lectura")
         reg = {"n": len(self.registros), "t": time.time(), "evento": evento, "prev": self.ultimo, **datos}
         if self.recuperacion:
             reg["recuperacion"] = True          # anotado sin clave: no lleva MAC
@@ -125,7 +136,8 @@ class Manifiesto:
             fd = _abrir_lectura(ruta)
             with os.fdopen(fd, "rb") as fh:
                 datos = fh.read()
-            lineas = datos.decode("utf-8").splitlines()
+            corte = datos.rfind(b"\n") + 1                 # todo lo posterior es una línea incompleta
+            lineas = datos[:corte].decode("utf-8").splitlines()
         except (OSError, UnicodeDecodeError) as exc:
             raise ManifiestoCorrupto(f"no se puede leer el manifiesto: {exc}") from exc
         for i, linea in enumerate(lineas):
@@ -141,10 +153,10 @@ class Manifiesto:
             prev = reg["h"]
         if not regs or regs[0]["evento"] != "inicio":
             raise ManifiestoCorrupto("el manifiesto no empieza por un registro de inicio")
-        if not datos.endswith(b"\n"):
-            raise ManifiestoCorrupto("el manifiesto termina en una línea incompleta")
         if not verificar:
-            return cls(ruta, regs, tam=len(datos), recuperacion=True)
+            m = cls(ruta, regs, tam=len(datos), recuperacion=True)
+            m._cola = datos[corte:]
+            return m
         a = regs[0].get("autenticacion")
         if not isinstance(a, dict) or a.get("alg") != aut.ALG or a.get("formato") != FORMATO:
             raise ManifiestoNoAutenticado("manifiesto sin autenticación HMAC (formato F2 o alterado): "
@@ -152,8 +164,9 @@ class Manifiesto:
         try:
             clave = (almacen or aut.almacen_actual()).obtener(str(a.get("id_clave")))
         except aut.ClaveNoDisponible as exc:
-            raise ManifiestoNoAutenticado(f"{exc}: sin la clave no se puede autenticar el manifiesto "
-                                          "(ver «Pérdida de clave» en docs/SEGURIDAD-F3.md)") from exc
+            raise ManifiestoNoAutenticado(f"{exc}: sin la clave no se puede autenticar el manifiesto; usa "
+                                          "`restore --recuperacion-sin-clave` (inventario + confirmación manual, "
+                                          "docs/SEGURIDAD-F3.md §3.3)") from exc
         op = regs[0].get("op")
         if not isinstance(op, str):
             raise ManifiestoNoAutenticado("el registro de inicio no identifica la operación")
@@ -161,7 +174,33 @@ class Manifiesto:
             if not aut.verificar_registro(clave, op, reg):
                 raise ManifiestoNoAutenticado(f"MAC no válido en la línea {i + 1}: registro alterado, de otra "
                                               "operación o anotado sin clave")
-        return cls(ruta, regs, tam=len(datos), clave=clave)
+        m = cls(ruta, regs, tam=len(datos), clave=clave)
+        m._cola = datos[corte:]
+        return m
+
+    @property
+    def cola_incompleta(self) -> int:
+        return len(self._cola)
+
+    @property
+    def cola_descartada(self) -> bool:
+        return any(r["evento"] == "cola_descartada" for r in self.registros)
+
+    def reparar_cola(self) -> None:
+        """Recorta la línea final incompleta y lo anota (llamar con la operación bloqueada)."""
+        if not self._cola:
+            return
+        fd = os.open(self.ruta, os.O_WRONLY | os.O_NOFOLLOW)
+        try:
+            if os.fstat(fd).st_size != self._tam:
+                raise ManifiestoCorrupto("el manifiesto cambió desde que se cargó: no se repara")
+            valido = self._tam - len(self._cola)
+            os.ftruncate(fd, valido)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        cola, self._cola, self._tam = self._cola, b"", valido
+        self.anotar("cola_descartada", bytes=len(cola), sha256=hashlib.sha256(cola).hexdigest())
 
     @contextlib.contextmanager
     def bloquear(self):
@@ -179,7 +218,7 @@ class Manifiesto:
             if os.fstat(fd).st_size != self._tam:
                 fresco = Manifiesto.cargar(self.ruta, verificar=not self.recuperacion,
                                            almacen=_AlmacenFijo(self.clave) if self.clave else None)
-                self.registros, self._tam = fresco.registros, fresco._tam
+                self.registros, self._tam, self._cola = fresco.registros, fresco._tam, fresco._cola
             yield self
         finally:
             os.close(fd)                 # cerrar el descriptor libera el flock

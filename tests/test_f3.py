@@ -24,7 +24,13 @@ from maccleaner.config import cargar  # noqa: E402
 from maccleaner.manifiesto import Manifiesto, ManifiestoNoAutenticado  # noqa: E402
 from maccleaner.plan import PlanNoValido, calcular_huella, crear_plan, validar_plan  # noqa: E402
 from maccleaner.purgar import purgar, seleccionar  # noqa: E402
-from maccleaner.restaurar import restaurar  # noqa: E402
+from maccleaner.restaurar import inventario_recuperacion, restaurar, restaurar_recuperacion  # noqa: E402
+
+
+def recuperar_sin_clave(zona, op):
+    """F3.5: recuperación en dos pasos (inventario + confirmación con código)."""
+    inv = inventario_recuperacion(zona, op)
+    return inv, restaurar_recuperacion(zona, op, inv, inv["codigo"])
 
 from test_f2 import DIA, ENV_CLI, PROYECTO, VACIO, Caida, ZonaBase, escribir, huella_fichero  # noqa: E402
 
@@ -187,8 +193,9 @@ class TestManifiestoAutenticado(ZonaBase):
         self.assertIn("MAC no válido", sel["descartadas"][0]["motivo"])
         # Los ficheros siguen en la cuarentena: la recuperación sin clave restaura lo no manipulado y rechaza el
         # elemento cuyo origen se editó (destino y origen ya no son coherentes).
-        r = restaurar(self.zona, res["op"], sin_clave=True)
-        self.assertEqual((r["restaurados"], r["errores"]), (3, 1))
+        inv, r = recuperar_sin_clave(self.zona, res["op"])
+        self.assertEqual(sorted(e["clasificacion"] for e in inv["elementos"]), ["ambiguo"] + ["restaurable"] * 3)
+        self.assertEqual((r["restaurados"], r["omitidos"]), (3, 0))
         self.assertFalse(os.path.exists(editado["original"] + ".otro"))
         self.assertFalse(os.path.exists(editado["original"]))       # sigue en la cuarentena, para revisión
         for ruta, h in antes.items():
@@ -209,11 +216,12 @@ class TestManifiestoAutenticado(ZonaBase):
         reencadenar(res["manifiesto"], quitar_aut)
         with self.assertRaisesRegex(ManifiestoNoAutenticado, "sin autenticación"):
             restaurar(self.zona, res["op"])
-        r = restaurar(self.zona, res["op"], sin_clave=True)
-        self.assertEqual((r["restaurados"], r["errores"]), (4, 0))
+        _, r = recuperar_sin_clave(self.zona, res["op"])
+        self.assertEqual((r["restaurados"], r["omitidos"]), (4, 0))
         self.todo_en_su_sitio(antes)
         man = Manifiesto.cargar(res["manifiesto"], verificar=False)
-        self.assertTrue(all(x.get("recuperacion") for x in man.registros if x["evento"] == "restaurado"))
+        self.assertFalse(any(x["evento"] == "restaurado" for x in man.registros))   # F3.5: el manifiesto no se toca
+        self.assertTrue(os.path.exists(os.path.join(res["cuarentena"], "recuperacion.jsonl")))
 
 
 class TestPerdidaYRotacionDeClave(ZonaBase):
@@ -227,8 +235,8 @@ class TestPerdidaYRotacionDeClave(ZonaBase):
         r = purgar(self.zona, dias=14, ahora=t + 20 * DIA, ejecutar=True)
         self.assertEqual(r["borrados"], 0)                          # nunca se purga sin MAC válidos
         self.assertTrue(all(os.path.exists(e["destino"]) for e in Manifiesto.cargar(res["manifiesto"], verificar=False).estados().values()))
-        r = restaurar(self.zona, res["op"], sin_clave=True)
-        self.assertEqual((r["restaurados"], r["errores"]), (4, 0))
+        _, r = recuperar_sin_clave(self.zona, res["op"])
+        self.assertEqual((r["restaurados"], r["omitidos"]), (4, 0))
         self.todo_en_su_sitio(antes)
 
     def test_rotacion_mantiene_verificables_las_operaciones_antiguas(self):
@@ -325,6 +333,11 @@ class LlaveroFalso:
 
     def escribir(self, cuenta, valor, reemplazar=False):
         if cuenta in self.d and not reemplazar:
+            raise aut.ClaveNoDisponible("duplicada")
+        self.d[cuenta] = valor
+
+    def crear_con_confirmacion(self, cuenta, valor):
+        if cuenta in self.d:
             raise aut.ClaveNoDisponible("duplicada")
         self.d[cuenta] = valor
 

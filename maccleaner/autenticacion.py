@@ -16,6 +16,11 @@ Diseño
       clave activa y la lista de claves (no secreta).
     - AlmacenSintetico: claves en memoria para pruebas y zonas sintéticas. Sus claves están marcadas como
       sintéticas y NUNCA autentican un plan sobre datos reales.
+* Control de acceso (F3.5): las entradas de CLAVE se crean con una lista de aplicaciones de confianza VACÍA
+  (SecAccessCreate + SecKeychainItemCreateFromContent). Cada lectura exige la confirmación del usuario en un
+  diálogo del sistema, también para el propio intérprete de Python. Con la ACL por defecto (F3), el intérprete
+  que creó la entrada la leía sin preguntar, y con él cualquier script ejecutado con ese mismo Python.
+  El almacén guarda la clave en memoria tras la primera lectura: un diálogo por proceso y clave.
 * Selección del almacén (almacen_actual): el fijado con establecer_almacen() (pruebas); si no, la variable
   MAC_CLEANER_CLAVE_SINTETICA (hex de 64 caracteres, solo zonas sintéticas); si no, el Llavero.
 """
@@ -119,15 +124,46 @@ class AlmacenSintetico:
         return {"almacen": "sintetico", "activa": self._activa, "claves": sorted(self._claves)}
 
 
+_ERRORES_LLAVERO = {
+    -25293: "acceso denegado o no confirmado (o Llavero bloqueado)",
+    -25308: "el Llavero necesita la confirmación del usuario y no hay sesión gráfica",
+    -128: "el usuario canceló la confirmación",
+    -25291: "no hay Llavero disponible",
+}
+
+
+class _Atributo(ctypes.Structure):
+    _fields_ = [("tag", ctypes.c_uint32), ("length", ctypes.c_uint32), ("data", ctypes.c_void_p)]
+
+
+class _ListaAtributos(ctypes.Structure):
+    _fields_ = [("count", ctypes.c_uint32), ("attr", ctypes.POINTER(_Atributo))]
+
+
+def _fcc(s: bytes) -> int:
+    return int.from_bytes(s, "big")
+
+
 class _Llavero:
-    """Acceso mínimo al Llavero con la API clásica de Security.framework (ctypes; sin subprocesos ni argv)."""
+    """Acceso mínimo al Llavero con la API clásica de Security.framework (ctypes; sin subprocesos ni argv).
+    `ref` permite usar un Llavero concreto (las pruebas opcionales usan uno temporal); None = el predeterminado."""
     errSecItemNotFound = -25300
     errSecDuplicateItem = -25299
 
-    def __init__(self):
+    def __init__(self, ref=None):
+        self.ref = ref
         self.s = ctypes.CDLL("/System/Library/Frameworks/Security.framework/Security")
         self.cf = ctypes.CDLL("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
         u32, vp, cp = ctypes.c_uint32, ctypes.c_void_p, ctypes.c_char_p
+        self.s.SecAccessCreate.argtypes = [vp, vp, ctypes.POINTER(vp)]
+        self.s.SecAccessCreate.restype = ctypes.c_int32
+        self.s.SecKeychainItemCreateFromContent.argtypes = [u32, ctypes.POINTER(_ListaAtributos), u32, cp, vp, vp,
+                                                            ctypes.POINTER(vp)]
+        self.s.SecKeychainItemCreateFromContent.restype = ctypes.c_int32
+        self.cf.CFStringCreateWithCString.argtypes = [vp, cp, u32]
+        self.cf.CFStringCreateWithCString.restype = vp
+        self.cf.CFArrayCreate.argtypes = [vp, vp, ctypes.c_long, vp]
+        self.cf.CFArrayCreate.restype = vp
         self.s.SecKeychainFindGenericPassword.argtypes = [vp, u32, cp, u32, cp, ctypes.POINTER(u32),
                                                            ctypes.POINTER(vp), ctypes.POINTER(vp)]
         self.s.SecKeychainAddGenericPassword.argtypes = [vp, u32, cp, u32, cp, u32, cp, ctypes.POINTER(vp)]
@@ -141,12 +177,12 @@ class _Llavero:
     def leer(self, cuenta: str) -> bytes | None:
         srv, acc = SERVICIO_LLAVERO.encode(), cuenta.encode()
         n, datos, item = ctypes.c_uint32(), ctypes.c_void_p(), ctypes.c_void_p()
-        r = self.s.SecKeychainFindGenericPassword(None, len(srv), srv, len(acc), acc, ctypes.byref(n),
+        r = self.s.SecKeychainFindGenericPassword(self.ref, len(srv), srv, len(acc), acc, ctypes.byref(n),
                                                   ctypes.byref(datos), ctypes.byref(item))
         if r == self.errSecItemNotFound:
             return None
         if r != 0:
-            raise ClaveNoDisponible(f"Llavero: error {r} al leer {cuenta}")
+            raise ClaveNoDisponible(f"Llavero: error {r} al leer {cuenta}: {_ERRORES_LLAVERO.get(r, 'error desconocido')}")
         try:
             return ctypes.string_at(datos, n.value)
         finally:
@@ -156,10 +192,10 @@ class _Llavero:
 
     def escribir(self, cuenta: str, valor: bytes, reemplazar: bool = False) -> None:
         srv, acc = SERVICIO_LLAVERO.encode(), cuenta.encode()
-        r = self.s.SecKeychainAddGenericPassword(None, len(srv), srv, len(acc), acc, len(valor), valor, None)
+        r = self.s.SecKeychainAddGenericPassword(self.ref, len(srv), srv, len(acc), acc, len(valor), valor, None)
         if r == self.errSecDuplicateItem and reemplazar:
             n, datos, item = ctypes.c_uint32(), ctypes.c_void_p(), ctypes.c_void_p()
-            r = self.s.SecKeychainFindGenericPassword(None, len(srv), srv, len(acc), acc, ctypes.byref(n),
+            r = self.s.SecKeychainFindGenericPassword(self.ref, len(srv), srv, len(acc), acc, ctypes.byref(n),
                                                       ctypes.byref(datos), ctypes.byref(item))
             if r == 0:
                 self.s.SecKeychainItemFreeContent(None, datos)
@@ -170,12 +206,38 @@ class _Llavero:
         if r != 0:
             raise ClaveNoDisponible(f"Llavero: error {r} al guardar {cuenta}")
 
+    def crear_con_confirmacion(self, cuenta: str, valor: bytes) -> None:
+        """Crea una entrada NUEVA cuya ACL no confía en ninguna aplicación: cada lectura pide confirmación."""
+        vp = ctypes.c_void_p
+        desc = self.cf.CFStringCreateWithCString(None, b"mac-cleaner: clave HMAC", 0x08000100)
+        callbacks = ctypes.c_void_p.in_dll(self.cf, "kCFTypeArrayCallBacks")
+        vacia = self.cf.CFArrayCreate(None, None, 0, ctypes.addressof(callbacks))
+        acceso, item = vp(), vp()
+        try:
+            r = self.s.SecAccessCreate(desc, vacia, ctypes.byref(acceso))
+            if r != 0:
+                raise ClaveNoDisponible(f"Llavero: error {r} al preparar el control de acceso")
+            srv, acc = SERVICIO_LLAVERO.encode(), cuenta.encode()
+            b_srv, b_acc = ctypes.create_string_buffer(srv, len(srv)), ctypes.create_string_buffer(acc, len(acc))
+            attrs = (_Atributo * 2)(_Atributo(_fcc(b"svce"), len(srv), ctypes.cast(b_srv, vp)),
+                                    _Atributo(_fcc(b"acct"), len(acc), ctypes.cast(b_acc, vp)))
+            lista = _ListaAtributos(2, attrs)
+            r = self.s.SecKeychainItemCreateFromContent(_fcc(b"genp"), ctypes.byref(lista), len(valor), valor,
+                                                        self.ref, acceso, ctypes.byref(item))
+            if r != 0:
+                raise ClaveNoDisponible(f"Llavero: error {r} al guardar {cuenta}")
+        finally:
+            for x in (item.value, acceso.value, vacia, desc):
+                if x:
+                    self.cf.CFRelease(x)
+
 
 class AlmacenLlavero:
     """Claves HMAC en el Llavero de inicio de sesión. Crear o rotar exige una orden explícita del usuario."""
 
     def __init__(self, llavero: _Llavero | None = None):
         self.k = llavero or _Llavero()
+        self._cache: dict[str, Clave] = {}        # una confirmación por proceso y clave
 
     def _indice(self) -> dict:
         raw = self.k.leer(CUENTA_INDICE)
@@ -195,12 +257,14 @@ class AlmacenLlavero:
         return self.obtener(ind["activa"])
 
     def obtener(self, cid: str) -> Clave:
-        if not _ID_VALIDO.fullmatch(cid) or cid.startswith("sintetica-"):
+        if not isinstance(cid, str) or not _ID_VALIDO.fullmatch(cid) or cid.startswith("sintetica-"):
             raise ClaveNoDisponible(f"identificador de clave no válido para el Llavero: {cid!r}")
-        sec = self.k.leer(cid)
-        if sec is None or len(sec) != 32:
-            raise ClaveNoDisponible(f"la clave {cid} no está en el Llavero")
-        return Clave(cid, sec, False)
+        if cid not in self._cache:
+            sec = self.k.leer(cid)
+            if sec is None or len(sec) != 32:
+                raise ClaveNoDisponible(f"la clave {cid} no está en el Llavero")
+            self._cache[cid] = Clave(cid, sec, False)
+        return self._cache[cid]
 
     def crear(self) -> Clave:
         ind = self._indice()
@@ -213,7 +277,7 @@ class AlmacenLlavero:
 
     def _nueva(self, ind: dict) -> Clave:
         c = Clave(nuevo_id(False), secrets.token_bytes(32), False)
-        self.k.escribir(c.id, c.secreto)
+        self.k.crear_con_confirmacion(c.id, c.secreto)        # ACL vacía: cada lectura pide confirmación
         ind = {"activa": c.id, "claves": ind.get("claves", []) + [
             {"id": c.id, "creada": dt.datetime.now().isoformat(timespec="seconds")}]}
         self.k.escribir(CUENTA_INDICE, json.dumps(ind).encode(), reemplazar=True)

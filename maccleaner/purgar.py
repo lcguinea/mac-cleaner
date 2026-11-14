@@ -57,6 +57,10 @@ def seleccionar(zona: str, *, dias: float = DIAS_POR_DEFECTO, ahora: float | Non
         except ManifiestoCorrupto as exc:
             descartadas.append({"op": op, "motivo": f"manifiesto no válido: {exc}"})
             continue
+        if man.cola_incompleta or man.cola_descartada:
+            descartadas.append({"op": op, "motivo": "manifiesto con un registro final incompleto (posible caída): "
+                                                    "no se purga; restaura o revisa la operación"})
+            continue
         if not man.cerrado:
             descartadas.append({"op": op, "motivo": "operación sin cierre (incompleta): no se purga"})
             continue
@@ -92,6 +96,8 @@ def purgar(zona: str, *, dias: float = DIAS_POR_DEFECTO, ahora: float | None = N
             with man.bloquear():                    # recarga: decide con el estado más reciente
                 if man.inicio.get("zona") != zona or man.inicio.get("cuarentena") != qop:
                     raise ManifiestoCorrupto("el manifiesto pertenece a otra zona u operación")
+                if man.cola_incompleta or man.cola_descartada:
+                    raise ManifiestoCorrupto("registro final incompleto: no se purga")
                 b, er, sa = _purgar_operacion(man, qarch, {x["id"] for x in o["elementos"]})
         except ManifiestoOcupado as exc:
             ocupadas.append({"op": o["op"], "motivo": f"operación ocupada: {exc}"})
