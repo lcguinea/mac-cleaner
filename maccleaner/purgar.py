@@ -7,6 +7,14 @@ Reglas de selección (seleccionar):
 El borrado (purgar con ejecutar=True) exige zona sintética válida, comprueba el inodo de cada fichero
 contra el manifiesto antes de borrarlo, borra solo lo listado (nunca un rmtree) y solo retira directorios
 vacíos dentro de la propia cuarentena. Sin ejecutar=True solo devuelve la selección.
+
+F2.5:
+  * la retención mínima es 1 día también por línea de órdenes (`--dias`), no solo en el TOML;
+  * cada operación se purga con su manifiesto BLOQUEADO y releído: solo se borra lo que en ese momento sigue
+    en estado `movido` (un restore concurrente gana); si la operación está ocupada, se salta entera;
+  * el borrado es unlinkat sobre el MISMO descriptor de directorio con el que se comprobó el inodo: sustituir
+    un directorio intermedio por un enlace entre la comprobación y el borrado ya no desvía el borrado;
+  * los directorios vacíos se retiran con fwalk + rmdirat, sin seguir enlaces.
 """
 from __future__ import annotations
 
@@ -16,13 +24,16 @@ import time
 
 from . import fsseguro, zona as zona_mod
 from .aplicar import DIR_ARCHIVOS, directorio_cuarentena
-from .manifiesto import Manifiesto, ManifiestoCorrupto
+from .manifiesto import Manifiesto, ManifiestoCorrupto, ManifiestoOcupado
 
 DIA = 86400
 DIAS_POR_DEFECTO = 14
+DIAS_MINIMOS = 1
 
 
 def seleccionar(zona: str, *, dias: float = DIAS_POR_DEFECTO, ahora: float | None = None) -> dict:
+    if not isinstance(dias, (int, float)) or isinstance(dias, bool) or not dias >= DIAS_MINIMOS:
+        raise ValueError(f"la retención debe ser de al menos {DIAS_MINIMOS} día (recibido: {dias!r})")
     zona = zona_mod.validar_zona(zona)
     ahora = ahora or time.time()
     qbase = directorio_cuarentena(zona)
@@ -66,36 +77,71 @@ def purgar(zona: str, *, dias: float = DIAS_POR_DEFECTO, ahora: float | None = N
     if not ejecutar:
         return sel
     zona = zona_mod.validar_zona(sel["zona"])   # vuelve a validar inmediatamente antes de borrar
-    borrados = errores = 0
+    borrados = errores = saltados = 0
+    ocupadas = []
     for o in sel["seleccionadas"]:
         qop = os.path.join(directorio_cuarentena(zona), o["op"])
         qarch = os.path.join(qop, DIR_ARCHIVOS)
-        man = Manifiesto.cargar(os.path.join(qop, "manifiesto.jsonl"))
-        for x in o["elementos"]:
+        try:
+            man = Manifiesto.cargar(os.path.join(qop, "manifiesto.jsonl"))
+            with man.bloquear():                    # recarga: decide con el estado más reciente
+                if man.inicio.get("zona") != zona or man.inicio.get("cuarentena") != qop:
+                    raise ManifiestoCorrupto("el manifiesto pertenece a otra zona u operación")
+                b, er, sa = _purgar_operacion(man, qarch, {x["id"] for x in o["elementos"]})
+        except ManifiestoOcupado as exc:
+            ocupadas.append({"op": o["op"], "motivo": f"operación ocupada: {exc}"})
+            continue
+        except ManifiestoCorrupto as exc:
+            ocupadas.append({"op": o["op"], "motivo": f"manifiesto no válido al purgar: {exc}"})
+            continue
+        borrados, errores, saltados = borrados + b, errores + er, saltados + sa
+        _retirar_vacios(qarch)
+    sel.update(ejecutado=True, borrados=borrados, errores=errores, saltados=saltados, ocupadas=ocupadas)
+    return sel
+
+
+def _purgar_operacion(man: Manifiesto, qarch: str, seleccionados: set[str]) -> tuple[int, int, int]:
+    """Purga lo seleccionado que, releído bajo bloqueo, SIGUE en estado `movido`."""
+    borrados = errores = saltados = 0
+    estados = man.estados()
+    for eid in sorted(seleccionados):
+        x = estados.get(eid, {})
+        if x.get("estado") != "movido":
+            saltados += 1                   # restaurado o purgado por otro proceso entre selección y borrado
+            continue
+        try:
             rel = os.path.relpath(x["destino"], qarch)
             if rel.startswith("..") or os.path.isabs(rel):
-                man.anotar("error", id=x["id"], motivo="destino fuera de la cuarentena")
-                errores += 1
-                continue
+                raise ValueError("destino fuera de la cuarentena")
+            ino = x["meta"]["ino"]
+            fd = fsseguro.abrir_dir(qarch, os.path.dirname(rel))
             try:
-                fd = fsseguro.abrir_dir(qarch, os.path.dirname(rel))
-                try:
-                    st = fsseguro.stat_en(fd, os.path.basename(rel))
-                finally:
-                    os.close(fd)
-                if not stat.S_ISREG(st.st_mode) or st.st_ino != x["ino"]:
+                nombre = os.path.basename(rel)
+                st = fsseguro.stat_en(fd, nombre)
+                if not stat.S_ISREG(st.st_mode) or st.st_ino != ino:
                     raise OSError("identidad distinta a la del manifiesto")
-                os.unlink(os.path.join(qarch, rel))   # ruta absoluta dentro de la cuarentena (0700) para la guardia
-                man.anotar("purgado", id=x["id"])
-                borrados += 1
-            except OSError as exc:
-                man.anotar("error", id=x["id"], motivo=f"purga: {exc}")
-                errores += 1
-        for d, dirs, files in os.walk(qarch, topdown=False):
-            if d != qarch and not os.listdir(d):
+                # unlinkat sobre el mismo descriptor verificado (la guardia resuelve dir_fd con F_GETPATH).
+                os.unlink(nombre, dir_fd=fd)
+            finally:
+                os.close(fd)
+            man.anotar("purgado", id=x["id"])
+            borrados += 1
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            man.anotar("error", id=x["id"], motivo=f"purga: {exc}")
+            errores += 1
+    return borrados, errores, saltados
+
+
+def _retirar_vacios(qarch: str) -> None:
+    """Retira directorios vacíos bajo la cuarentena de la operación, sin seguir enlaces (fwalk + rmdirat)."""
+    try:
+        # fwalk cierra cada descriptor tras entregarlo: hay que usarlo dentro del bucle. Con topdown=False los
+        # hijos llegan antes que el padre, así que al llegar al padre sus subdirectorios ya están vacíos.
+        for _raiz, dirs, _files, rootfd in os.fwalk(qarch, topdown=False):
+            for d in dirs:
                 try:
-                    os.rmdir(d)
+                    os.rmdir(d, dir_fd=rootfd)
                 except OSError:
                     pass
-    sel.update(ejecutado=True, borrados=borrados, errores=errores)
-    return sel
+    except OSError:
+        return

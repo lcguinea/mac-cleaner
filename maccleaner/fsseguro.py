@@ -52,18 +52,35 @@ def abrir_dir(raiz: str, rel_dir: str) -> int:
         raise
 
 
-def asegurar_dir(raiz: str, rel_dir: str, modo: int = 0o700) -> int:
-    """Como abrir_dir, pero crea los componentes que falten (rutas absolutas, para la guardia) y
-    vuelve a abrirlos con O_NOFOLLOW: si alguien coloca un enlace, la apertura falla."""
-    actual = raiz
-    for comp in [c for c in rel_dir.split("/") if c]:
-        _nombre_simple(comp)
-        actual = os.path.join(actual, comp)
-        try:
-            os.mkdir(actual, modo)
-        except FileExistsError:
-            pass
-    return abrir_dir(raiz, rel_dir)
+class DirectorioInseguro(PermissionError):
+    pass
+
+
+def asegurar_dir(raiz: str, rel_dir: str, modo: int = 0o700, privado: bool = False) -> int:
+    """Como abrir_dir, pero crea los componentes que falten. Cada mkdir se hace RELATIVO al descriptor del
+    padre (mkdirat): un enlace colocado en un componente intermedio no desvía la creación, y la apertura
+    posterior con O_NOFOLLOW falla. Con privado=True cada componente debe ser del usuario y no escribible
+    por el grupo ni por otros (la cuarentena); si no, DirectorioInseguro."""
+    fd = os.open(raiz, _ABRIR_DIR)
+    try:
+        for comp in [c for c in rel_dir.split("/") if c]:
+            _nombre_simple(comp)
+            try:
+                os.mkdir(comp, modo, dir_fd=fd)
+            except FileExistsError:
+                pass
+            nfd = os.open(comp, _ABRIR_DIR, dir_fd=fd)
+            os.close(fd)
+            fd = nfd
+            if privado:
+                st = os.fstat(fd)
+                if st.st_uid != os.getuid() or st.st_mode & 0o022:
+                    raise DirectorioInseguro(errno.EPERM, f"directorio de cuarentena inseguro (propietario o permisos "
+                                             f"{stat.filemode(st.st_mode)}): {os.path.join(raiz, rel_dir)}")
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
 
 
 def stat_en(dir_fd: int, nombre: str) -> os.stat_result:

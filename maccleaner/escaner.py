@@ -107,12 +107,7 @@ class Escaner:
             self.errores.append({"ruta": ruta, "error": f"{type(exc).__name__}: {exc.strerror or exc}", "regla": regla})
 
     def _riesgo(self, regla: Regla, grupo: str) -> tuple[str, str]:
-        riesgo, motivo = regla.riesgo, "riesgo base de la regla"
-        orden = {"bajo": 0, "medio": 1, "alto": 2}
-        for aj in self.cfg.ajustes:
-            if aj.patron.search(grupo) and orden[aj.riesgo] > orden[riesgo]:
-                riesgo, motivo = aj.riesgo, aj.motivo
-        return riesgo, motivo
+        return riesgo_de(self.cfg, regla, grupo)
 
     # ── raíces ──
     def _raices(self, regla: Regla) -> tuple[list[str], dict | None]:
@@ -351,6 +346,16 @@ class Escaner:
         for tipo, ruta, _g, dato in self._iterar(regla, canon, inicio=grupo_ruta, grupo_inicial=nombre):
             if tipo == "fichero":
                 yield ruta, dato
+
+
+def riesgo_de(cfg: Config, regla: Regla, grupo: str) -> tuple[str, str]:
+    """Riesgo de un grupo: el de la regla, elevado por los [[ajuste_riesgo]] que coincidan con su nombre."""
+    riesgo, motivo = regla.riesgo, "riesgo base de la regla"
+    orden = {"bajo": 0, "medio": 1, "alto": 2}
+    for aj in cfg.ajustes:
+        if aj.patron.search(grupo) and orden[aj.riesgo] > orden[riesgo]:
+            riesgo, motivo = aj.riesgo, aj.motivo
+    return riesgo, motivo
 
 
 def ref_antiguedad(st) -> float:

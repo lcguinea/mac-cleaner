@@ -7,6 +7,16 @@ Comprobaciones por elemento:
   * en el destino: directorio padre existente y abierto con O_NOFOLLOW, y nombre libre. El movimiento usa
     RENAME_EXCL: si aparece un fichero en el último instante, el resultado es un conflicto, no una sobrescritura.
 
+Robustez (F2.5):
+  * la operación se restaura con el manifiesto bloqueado (flock); un apply, restore o purge simultáneo de la
+    misma operación se rechaza con ManifiestoOcupado;
+  * un error durante la restauración de un elemento `movido` se registra como `restaurar_error` SIN cambiar
+    su estado: el fichero sigue en cuarentena y un nuevo restore lo reintenta;
+  * si un restore anterior murió después de devolver el fichero y antes de anotarlo, el reintento lo
+    encuentra en el origen por su inodo y lo anota como restaurado;
+  * los ficheros sin SHA-256 (mayores que hash_max) se comprueban también por ctime: si cambió desde que
+    entraron en la cuarentena, alguien los tocó (contenido, permisos o atributos) y no se devuelven.
+
 Metadatos: el movimiento es un rename dentro del mismo volumen, así que el inodo es el mismo y se conservan
 el contenido, el modo, el propietario, mtime, atime, birthtime, los atributos extendidos, las ACL y los
 flags. NO se conservan: ctime (rename lo actualiza siempre), la mtime de los directorios padre (cambia al
@@ -20,7 +30,7 @@ import stat
 
 from . import fsseguro, zona as zona_mod
 from .aplicar import DIR_ARCHIVOS, directorio_cuarentena
-from .manifiesto import Manifiesto
+from .manifiesto import Manifiesto, ManifiestoOcupado  # noqa: F401  (ManifiestoOcupado: lo captura la CLI)
 
 
 class ErrorRestauracion(ValueError):
@@ -46,8 +56,26 @@ def _localizar(fd: int, nombre: str, ino: int) -> bool:
     return stat.S_ISREG(st.st_mode) and st.st_ino == ino
 
 
+def _en_origen(zona: str, rel_dir: str, nombre: str, ino: int) -> bool:
+    try:
+        ofd = fsseguro.abrir_dir(zona, rel_dir)
+    except OSError:
+        return False
+    try:
+        return _localizar(ofd, nombre, ino)
+    except OSError:
+        return False
+    finally:
+        os.close(ofd)
+
+
 def restaurar(zona: str, op: str, *, elemento: str | None = None, ruta: str | None = None) -> dict:
     zona, man = cargar_operacion(zona, op)
+    with man.bloquear():                     # recarga el manifiesto con la operación bloqueada
+        return _restaurar(zona, op, man, elemento, ruta)
+
+
+def _restaurar(zona: str, op: str, man: Manifiesto, elemento: str | None, ruta: str | None) -> dict:
     qarch = os.path.join(man.inicio["cuarentena"], DIR_ARCHIVOS)
     estados = man.estados()
     seleccion = [e for e in estados.values()
@@ -72,17 +100,20 @@ def restaurar(zona: str, op: str, *, elemento: str | None = None, ruta: str | No
             en_cuarentena = qfd is not None and _localizar(qfd, nombre, meta["ino"])
             if e["estado"] == "intento" and not en_cuarentena:
                 # Caída entre «intento» y el movimiento: el fichero debería seguir en su sitio.
-                try:
-                    ofd = fsseguro.abrir_dir(zona, rel_dir)
-                    sigue = _localizar(ofd, nombre, meta["ino"])
-                    os.close(ofd)
-                except OSError:
-                    sigue = False
-                man.anotar("no_movido" if sigue else "error", id=e["id"],
+                sigue = _en_origen(zona, rel_dir, nombre, meta["ino"])
+                # Si no aparece, no se cambia el estado («intento»): un restore posterior lo vuelve a buscar.
+                man.anotar("no_movido" if sigue else "restaurar_error", id=e["id"],
                            motivo=None if sigue else "no está ni en el origen ni en la cuarentena")
                 res["sin_cambios" if sigue else "errores"] += 1
                 res["detalle"].append({"id": e["id"], "resultado": "no se llegó a mover" if sigue else "no localizado"})
                 continue
+            if not en_cuarentena:
+                # ¿Un restore anterior lo devolvió y murió antes de anotarlo? Se busca por inodo en el origen.
+                if _en_origen(zona, rel_dir, nombre, meta["ino"]):
+                    man.anotar("restaurado", id=e["id"], ino=meta["ino"], recuperado=True)
+                    res["restaurados"] += 1
+                    res["detalle"].append({"id": e["id"], "resultado": "ya estaba en su sitio (restore anterior interrumpido)"})
+                    continue
             if qfd is None:
                 raise ErrorRestauracion(f"cuarentena inaccesible: {q_err}")
             if not en_cuarentena:
@@ -90,8 +121,12 @@ def restaurar(zona: str, op: str, *, elemento: str | None = None, ruta: str | No
             st = fsseguro.stat_en(qfd, nombre)
             if (st.st_size, st.st_mtime_ns, st.st_mode, st.st_uid) != (meta["tam"], meta["mtime_ns"], meta["modo"], meta["uid"]):
                 raise ErrorRestauracion("el fichero en cuarentena fue modificado (tamaño, mtime, modo o propietario)")
-            if meta.get("sha256") and fsseguro.sha256_en(qfd, nombre, st.st_ino) != meta["sha256"]:
-                raise ErrorRestauracion("el contenido en cuarentena no coincide (SHA-256)")
+            if meta.get("sha256"):
+                if fsseguro.sha256_en(qfd, nombre, st.st_ino) != meta["sha256"]:
+                    raise ErrorRestauracion("el contenido en cuarentena no coincide (SHA-256)")
+            elif e.get("ctime_movido") is not None and st.st_ctime_ns != e["ctime_movido"]:
+                raise ErrorRestauracion("el fichero en cuarentena cambió desde que entró (ctime) y no tiene SHA-256 "
+                                        "con que verificar el contenido: no se devuelve; revísalo a mano")
             try:
                 ofd = fsseguro.abrir_dir(zona, rel_dir)
             except FileNotFoundError:
@@ -125,7 +160,8 @@ def restaurar(zona: str, op: str, *, elemento: str | None = None, ruta: str | No
             finally:
                 os.close(ofd)
         except (ErrorRestauracion, OSError) as exc:
-            man.anotar("error", id=e["id"], motivo=str(exc))
+            # Sin cambiar el estado: el elemento sigue en cuarentena y se puede reintentar.
+            man.anotar("restaurar_error", id=e["id"], motivo=str(exc))
             res["errores"] += 1
             res["detalle"].append({"id": e["id"], "resultado": f"error: {exc}"})
         finally:

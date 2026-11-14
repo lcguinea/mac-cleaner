@@ -7,6 +7,7 @@ Una vez activada no se puede desactivar dentro del proceso. Bloquea, lanzando Pe
 """
 from __future__ import annotations
 
+import fcntl
 import os
 import sys
 
@@ -16,18 +17,31 @@ _EVENTOS_RUTA = {
     "os.utime", "os.truncate", "os.link", "os.symlink", "os.mkdir", "os.chflags", "os.lchflags",
     "os.setxattr", "os.removexattr", "shutil.rmtree", "shutil.move", "shutil.copyfile", "shutil.copytree",
 }
+# Posición del argumento dir_fd en los eventos de auditoría que lo admiten (os.remove(path, dir_fd), etc.).
+_POS_DIR_FD = {"os.remove": (1,), "os.rmdir": (1,), "os.mkdir": (2,), "os.chmod": (2,), "os.chown": (3,),
+               "os.utime": (3,), "os.rename": (2, 3), "os.replace": (2, 3), "os.link": (2, 3), "os.symlink": (None, 2)}
 EJECUTABLES_PERMITIDOS = {"lsof", "tmutil", "brew", "pip3", "pip"}
 
 registro: list[str] = []
 _activa = False
 
 
-def _bajo(ruta, base: str) -> bool:
+def _ruta_de_fd(fd: int) -> str:
+    """Ruta actual de un descriptor de directorio (fcntl F_GETPATH de macOS)."""
+    return os.fsdecode(fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(1024)).split(b"\0", 1)[0])
+
+
+def _bajo(ruta, base: str, dir_fd=None) -> bool:
     if isinstance(ruta, int):          # descriptor ya abierto: no es una ruta nueva
         return True
     try:
-        r = os.path.realpath(os.fsdecode(ruta))
-    except (TypeError, ValueError):
+        r = os.fsdecode(ruta)
+        if not os.path.isabs(r):
+            # Relativa a un descriptor (openat/unlinkat…): se resuelve contra la ruta REAL de ese
+            # descriptor, no contra el directorio de trabajo.
+            r = os.path.join(_ruta_de_fd(dir_fd) if isinstance(dir_fd, int) and dir_fd >= 0 else os.getcwd(), r)
+        r = os.path.realpath(r)
+    except (TypeError, ValueError, OSError):
         return False
     return r == base or r.startswith(base + "/")
 
@@ -48,8 +62,13 @@ def activar(directorio_permitido: str) -> None:
                 registro.append(f"BLOQUEADO open({ruta!r}, {modo!r})")
                 raise PermissionError(f"mac-cleaner (solo lectura): escritura bloqueada en {ruta}")
         elif evento in _EVENTOS_RUTA:
-            rutas = [a for a in args if isinstance(a, (str, bytes, os.PathLike))][:2]
-            if not rutas or not all(_bajo(r, base) for r in rutas):
+            pos = _POS_DIR_FD.get(evento, ())
+            rutas = []
+            for i, a in enumerate(args):
+                if isinstance(a, (str, bytes, os.PathLike)) and len(rutas) < 2:
+                    j = pos[len(rutas)] if len(rutas) < len(pos) else None
+                    rutas.append((a, args[j] if j is not None and j < len(args) else None))
+            if not rutas or not all(_bajo(r, base, fd) for r, fd in rutas):
                 registro.append(f"BLOQUEADO {evento}{args!r}")
                 raise PermissionError(f"mac-cleaner (solo lectura): {evento} bloqueado")
         elif evento == "subprocess.Popen":

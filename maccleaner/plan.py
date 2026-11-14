@@ -14,7 +14,9 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import math
 import os
+import re
 import secrets
 import time
 
@@ -141,6 +143,29 @@ CAMPOS_ELEMENTO = ("id", "regla", "grupo", "riesgo", "ruta", "dev", "ino", "uid"
                    "mtime_ns", "ctime_ns", "sha256", "edad_minima_dias")
 
 
+_CAMPOS_TEXTO = ("id", "regla", "grupo", "ruta")
+_CAMPOS_ENTEROS = ("dev", "ino", "uid", "modo", "tam", "bloques", "mtime_ns", "ctime_ns", "edad_minima_dias")
+_HEX64 = re.compile(r"[0-9a-f]{64}")
+
+
+def _es_numero(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
+def _validar_tipos(e: dict) -> None:
+    """Tipos exactos de cada campo: un plan forjado no debe poder provocar TypeError/ValueError internos."""
+    for c in _CAMPOS_TEXTO:
+        if not isinstance(e[c], str) or not e[c]:
+            raise PlanNoValido(f"{e.get('id')!r}: «{c}» debe ser texto no vacío")
+    for c in _CAMPOS_ENTEROS:
+        if not isinstance(e[c], int) or isinstance(e[c], bool) or e[c] < 0:
+            raise PlanNoValido(f"{e['id']}: «{c}» debe ser un entero no negativo")
+    if e["riesgo"] not in ("bajo", "medio"):
+        raise PlanNoValido(f"{e['id']}: riesgo no válido {e['riesgo']!r}")
+    if e["sha256"] is not None and not (isinstance(e["sha256"], str) and _HEX64.fullmatch(e["sha256"])):
+        raise PlanNoValido(f"{e['id']}: «sha256» debe ser null o 64 dígitos hexadecimales")
+
+
 def validar_plan(plan: dict, ahora: float | None = None) -> str:
     """Comprobaciones estructurales previas a cualquier operación. Devuelve la zona canónica."""
     ahora = ahora or time.time()
@@ -150,19 +175,32 @@ def validar_plan(plan: dict, ahora: float | None = None) -> str:
         raise PlanNoValido(f"versión de plan no admitida: {plan.get('version')}")
     if plan.get("huella") != calcular_huella(plan):
         raise PlanNoValido("la huella no coincide: el plan fue modificado o está dañado")
-    creado, caduca = float(plan.get("creado", 0)), float(plan.get("caduca", 0))
+    for clave in ("creado", "caduca"):
+        if not _es_numero(plan.get(clave)):
+            raise PlanNoValido(f"campo «{clave}» ausente o no numérico")
+    for clave in ("id", "home", "tmpdir", "config", "config_sha256"):
+        if not isinstance(plan.get(clave), str) or not plan[clave]:
+            raise PlanNoValido(f"campo «{clave}» ausente o no es texto")
+    if not isinstance(plan.get("elementos"), list):
+        raise PlanNoValido("«elementos» debe ser una lista")
+    creado, caduca = float(plan["creado"]), float(plan["caduca"])
     if creado > ahora + TOLERANCIA_FUTURO_S:
         raise PlanNoValido("el plan tiene fecha de creación futura")
     if ahora > caduca or caduca - creado > CADUCIDAD_PLAN_H * 3600 + 1:
         raise PlanNoValido("el plan ha caducado: vuelve a ejecutar `scan` y `plan`")
+    if plan.get("zona") is not None and not isinstance(plan["zona"], str):
+        raise PlanNoValido("«zona» debe ser texto")
     zona = zona_mod.validar_zona(plan.get("zona"))   # sin zona → limpieza real deshabilitada
     vistos_ruta, vistos_id, vistos_ino = set(), set(), set()
-    for e in plan.get("elementos", []):
+    for e in plan["elementos"]:
+        if not isinstance(e, dict):
+            raise PlanNoValido("elemento que no es un objeto")
         faltan = [c for c in CAMPOS_ELEMENTO if c not in e]
         if faltan:
             raise PlanNoValido(f"elemento sin campos {faltan}")
         if e["riesgo"] == "alto":
             raise PlanNoValido(f"{e['id']}: un plan no puede contener elementos de riesgo alto")
+        _validar_tipos(e)
         zona_mod.exigir_dentro(e["ruta"], zona)
         for conjunto, clave in ((vistos_ruta, e["ruta"]), (vistos_id, e["id"]), (vistos_ino, (e["dev"], e["ino"]))):
             if clave in conjunto:

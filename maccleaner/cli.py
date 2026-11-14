@@ -143,13 +143,14 @@ def cmd_plan(a: argparse.Namespace) -> int:
 
 def cmd_apply(a: argparse.Namespace) -> int:
     from .aplicar import Aplicador
+    from .fsseguro import DirectorioInseguro
     from .plan import PlanNoValido, cargar as cargar_plan
     try:
         plan = cargar_plan(a.plan)
         zona = zona_mod.validar_zona(plan.get("zona"))
         guardia.activar(zona)                      # solo se puede escribir dentro de la zona
         res = Aplicador(plan).aplicar()
-    except (PlanNoValido, zona_mod.ZonaNoValida, ErrorConfig) as exc:
+    except (PlanNoValido, zona_mod.ZonaNoValida, ErrorConfig, DirectorioInseguro) as exc:
         print(f"apply rechazado: {exc}", file=sys.stderr)
         return 2
     print(json.dumps(res, ensure_ascii=False, indent=1))
@@ -157,13 +158,13 @@ def cmd_apply(a: argparse.Namespace) -> int:
 
 
 def cmd_restore(a: argparse.Namespace) -> int:
-    from .manifiesto import ManifiestoCorrupto
+    from .manifiesto import ManifiestoCorrupto, ManifiestoOcupado
     from .restaurar import ErrorRestauracion, restaurar
     try:
         zona = zona_mod.validar_zona(a.zona)
         guardia.activar(zona)
         res = restaurar(zona, a.operacion, elemento=a.elemento, ruta=a.ruta)
-    except (zona_mod.ZonaNoValida, ManifiestoCorrupto, ErrorRestauracion) as exc:
+    except (zona_mod.ZonaNoValida, ManifiestoCorrupto, ManifiestoOcupado, ErrorRestauracion) as exc:
         print(f"restore rechazado: {exc}", file=sys.stderr)
         return 2
     print(json.dumps(res, ensure_ascii=False, indent=1))
@@ -177,7 +178,7 @@ def cmd_purge(a: argparse.Namespace) -> int:
         guardia.activar(zona)
         cfg_dias = a.dias if a.dias is not None else cargar(a.config).dias_cuarentena
         res = purgar(zona, dias=cfg_dias, ejecutar=a.ejecutar)
-    except (zona_mod.ZonaNoValida, ErrorConfig) as exc:
+    except (zona_mod.ZonaNoValida, ErrorConfig, ValueError) as exc:
         print(f"purge rechazado: {exc}", file=sys.stderr)
         return 2
     print(json.dumps(res, ensure_ascii=False, indent=1))
