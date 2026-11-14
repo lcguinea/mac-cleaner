@@ -1,0 +1,9 @@
+# Resultados de escaneos y planes: contienen rutas y datos del equipo
+informes/
+# Investigación REA y estado del equipo: solo en local (metadatos de binarios propietarios, datos personales)
+docs/investigacion-rea/
+docs/ESTADO-MAC-*.md
+# Sistema y Python
+.DS_Store
+__pycache__/
+*.pyc

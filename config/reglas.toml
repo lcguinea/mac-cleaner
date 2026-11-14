@@ -1,0 +1,132 @@
+# mac-cleaner · reglas F1 (solo diagnóstico y escaneo)
+#
+# Este fichero solo AMPLÍA la protección. Las protecciones mínimas están fijadas en
+# maccleaner/guards.py (PROTECCION_FIJA) y no se pueden desactivar desde aquí.
+# Las rutas admiten "~" y "$TMPDIR". Las raíces de escaneo deben quedar dentro de las
+# bases permitidas (guards.BASES_PERMITIDAS); si no, la regla se rechaza.
+
+[general]
+edad_minima_dias = 30        # por defecto, si la regla no indica otra
+top_grupos = 25              # grupos que se muestran en el informe
+usar_lsof = true             # una sola instantánea de ficheros abiertos (lsof -u <uid>)
+baja_prioridad = true        # nice +10 y E/S en modo «throttle» (setiopolicy_np)
+
+[cuarentena]
+# F2: días que un elemento permanece en cuarentena antes de poder purgarse (purge solo opera en zonas sintéticas).
+dias = 14
+# Ficheros de hasta este tamaño se verifican con SHA-256 al planificar, aplicar y restaurar.
+hash_max_mb = 64
+
+[proteccion]
+# Prefijos protegidos (se comparan tras realpath). Se podan antes de listarlos.
+rutas = [
+  "~/Library/Caches/claude-cli-nodejs",
+  "~/Library/Caches/com.anthropic.claudefordesktop",
+  "~/Library/Caches/Codex",
+  "~/Library/Caches/com.google.antigravity",
+  "~/Library/Caches/ms-playwright-mcp",       # navegador del MCP de Playwright (lo usan Claude y Argos)
+  "~/.npm/_npx",                              # paquetes ejecutables por npx (p. ej. herramientas MCP)
+]
+
+# Expresiones regulares sobre CADA componente del nombre (sin distinguir mayúsculas).
+nombres = [
+  '(claude|anthropic)',
+  'argos',
+  '^rea($|[-_. ])',
+  'codex',
+  '(gemini|antigravity)',
+  'aeon',
+  '(ollama|lm.?studio|huggingface|gguf|diffusers|comfyui)',
+  '(ableton|logic ?pro|^logic$|com\.apple\.(logic|garageband|mainstage)|pro ?tools|^avid$|soundflow|splice|native ?instruments|kontakt|izotope|spitfire|waves|arturia|universal ?audio|melodyne|celemony|fabfilter|steinberg|cubase|serato|rekordbox)',
+  '(remotion|davinci|resolve|final ?cut|premiere|after ?effects|blender|cinema ?4d|redshift|octane|render)',
+  '(keychain|1password|bitwarden|lastpass|gnupg|credential|secret|wallet|\.ssh$|\.aws$|\.kube$)',
+]
+
+# Extensiones de ficheros que nunca se contabilizan (producción musical, renders, modelos, claves).
+extensiones = [
+  ".als", ".alp", ".logicx", ".band", ".ptx", ".ptf", ".flp", ".cpr", ".rpp", ".aup3", ".sesx",
+  ".wav", ".aif", ".aiff", ".flac", ".mid", ".midi",
+  ".mov", ".mp4", ".mxf", ".braw", ".r3d", ".prproj", ".fcpbundle", ".drp", ".aep",
+  ".gguf", ".safetensors", ".ckpt", ".pt", ".pth", ".onnx", ".mlmodel", ".mlpackage", ".tflite",
+  ".pem", ".key", ".p12", ".pfx", ".keychain", ".keychain-db", ".kdbx", ".env",
+]
+
+# Si un directorio contiene alguno de estos nombres, se considera proyecto o entorno y se poda entero.
+marcadores_proyecto = [
+  ".git", ".hg", ".svn", "pyproject.toml", "setup.py", "package.json", "Cargo.toml", "go.mod",
+  "Package.swift", "Gemfile", "pom.xml", "build.gradle", "CMakeLists.txt", "Makefile", ".claude",
+]
+marcadores_venv = ["pyvenv.cfg", "conda-meta"]   # los directorios llamados venv/.venv se protegen por nombre (guards.py)
+
+# Ajustes de riesgo por nombre de grupo (el primer componente bajo la raíz de la regla).
+[[ajuste_riesgo]]
+patron = '(telegram|keepcoder|whatsapp|wechat|signal)'
+riesgo = "alto"
+motivo = "puede contener medios recibidos que el usuario no tiene en otro sitio"
+
+[[ajuste_riesgo]]
+patron = '(google|chrome|edge|brave|firefox|safari)'
+riesgo = "medio"
+motivo = "caché de navegador: se regenera, pero el primer uso será más lento"
+
+[[ajuste_riesgo]]
+patron = '^com\.apple\.'
+riesgo = "medio"
+motivo = "caché del sistema o de apps de Apple: regenerable, gestión propia de macOS"
+
+# ── Reglas ────────────────────────────────────────────────────────────────────
+# tipo = "ruta"        recorre las rutas indicadas
+# tipo = "herramienta" pregunta a la herramienta dónde guarda su caché (sin modificarla) y la recorre
+# Las reglas más específicas deben ir ANTES: reclaman su raíz y las genéricas la saltan (sin doble conteo).
+
+[[regla]]
+id = "homebrew"
+tipo = "herramienta"
+herramienta = "brew"
+descripcion = "Descargas y bottles en caché de Homebrew"
+riesgo = "bajo"
+edad_minima_dias = 30
+limpieza_oficial = "brew cleanup --prune=30"
+
+[[regla]]
+id = "pip"
+tipo = "herramienta"
+herramienta = "pip"
+descripcion = "Caché HTTP y wheels de pip"
+riesgo = "bajo"
+edad_minima_dias = 0
+limpieza_oficial = "pip cache purge"
+
+[[regla]]
+id = "npm"
+tipo = "herramienta"
+herramienta = "npm"
+descripcion = "Caché de contenidos de npm (_cacache) y logs"
+riesgo = "bajo"
+edad_minima_dias = 0
+limpieza_oficial = "npm cache clean --force"
+
+[[regla]]
+id = "logs-usuario"
+tipo = "ruta"
+rutas = ["~/Library/Logs"]
+descripcion = "Logs de usuario e informes de diagnóstico"
+riesgo = "bajo"
+edad_minima_dias = 30
+
+[[regla]]
+id = "temporales"
+tipo = "ruta"
+rutas = ["$TMPDIR", "/private/tmp"]
+descripcion = "Temporales propios del usuario (solo ficheros cuyo propietario es el usuario)"
+riesgo = "medio"
+edad_minima_dias = 7
+solo_propietario = true
+
+[[regla]]
+id = "caches-usuario"
+tipo = "ruta"
+rutas = ["~/Library/Caches"]
+descripcion = "Cachés de aplicaciones del usuario"
+riesgo = "medio"
+edad_minima_dias = 30

@@ -1,0 +1,13 @@
+#!/bin/bash
+# Lanzador: elige un Python >= 3.11 (tomllib) sin instalar nada.
+set -euo pipefail
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+for py in "${MAC_CLEANER_PYTHON:-}" python3 /opt/homebrew/bin/python3 /opt/homebrew/bin/python3.14 /opt/homebrew/bin/python3.12 /usr/local/bin/python3; do
+  [ -n "$py" ] || continue
+  command -v "$py" >/dev/null 2>&1 || continue
+  if "$py" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null; then
+    PYTHONDONTWRITEBYTECODE=1 exec "$py" -I -B -c 'import sys; sys.path.insert(0, sys.argv[1]); from maccleaner.cli import main; sys.exit(main(sys.argv[2:]))' "$DIR" "$@"
+  fi
+done
+echo "mac-cleaner: se necesita Python 3.11 o superior" >&2
+exit 1
