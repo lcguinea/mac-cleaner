@@ -39,7 +39,7 @@ CACHE_REL = "Library/Caches/pip"           # relativa al HOME real
 MAX_BYTES = 1_500_000_000
 DIAS_CUARENTENA = 14
 # Ventana (inicio, fin) en hora local ISO, p. ej. ("2026-11-24T10:00", "2026-11-24T12:00"). None = sin ventana.
-VENTANA: tuple[str, str] | None = None
+VENTANA: tuple[str, str] | None = ("2026-11-23T15:00", "2026-11-23T16:00")   # dada por el usuario el 23-11 a las 15:01: «ahora, durante la próxima hora»
 SOMBRA_MAX_EDAD_S = 2 * 3600
 
 _PROCESO = re.compile(r"(^|[\s/])(pip3?(\.\d+)?|npm|npx)(\s|$)|\s-m\s+pip(\s|$)")
