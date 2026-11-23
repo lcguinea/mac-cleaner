@@ -32,6 +32,12 @@ o entorno y sin enlaces). Lo que no está en la lista blanca se omite. Solo cód
 (`lista_blanca=`): la CLI no tiene esa opción y el plan no la decide.
 Un elemento que no supera una comprobación se OMITE (con motivo) y se sigue con el siguiente. Un error del
 sistema al mover ABORTA el resto: lo ya movido queda registrado y es restaurable.
+
+F4B (plan con bloque `real`): validar_plan comprueba la autorización (ventana, regla, topes, clave no sintética).
+Aquí, además: HOME del plan = HOME real; la caché de pip se vuelve a localizar AHORA y debe ser ~/Library/Caches/pip;
+lsof disponible y ni pip ni npm en ejecución; la lista blanca es la OFICIAL restringida a la regla autorizada (pasar
+otra se rechaza); y antes de cada movimiento se comprueba que no se superan los topes de ficheros y bytes (si se
+superaran, se aborta: lo movido es restaurable). La cuarentena es ~/.mac-cleaner/cuarentena.
 """
 from __future__ import annotations
 
@@ -42,7 +48,7 @@ import secrets
 import stat
 import time
 
-from . import autenticacion as aut, fsseguro, listablanca, zona as zona_mod
+from . import autenticacion as aut, autorizacion, fsseguro, listablanca, zona as zona_mod
 from .config import cargar as cargar_config
 from .escaner import DIA, ref_antiguedad, riesgo_de
 from .guards import bajo, expandir
@@ -55,7 +61,7 @@ DIR_PLANES = "planes-aplicados"
 
 
 def directorio_cuarentena(zona: str) -> str:
-    return os.path.join(zona, zona_mod.NOMBRE_CUARENTENA)
+    return zona_mod.directorio_cuarentena(zona)
 
 
 class Aplicador:
@@ -65,15 +71,31 @@ class Aplicador:
         self.ahora = ahora or time.time()
         self.zona = validar_plan(plan, self.ahora)
         self.clave = aut.verificar_plan(plan)          # ya verificado en validar_plan; se reutiliza su clave
-        for clave in ("home", "tmpdir"):
-            if not bajo(os.path.realpath(plan[clave]), self.zona):
-                raise PlanNoValido(f"el {clave} del plan no está dentro de la zona sintética")
+        self.real = "real" in plan
+        if self.real:
+            if self.clave.sintetica:
+                raise PlanNoValido("una clave sintética no puede autorizar un plan real")
+            if lista_blanca not in (None, listablanca.OFICIAL):
+                raise PlanNoValido("un plan real solo admite la lista blanca OFICIAL")
+            if os.path.realpath(plan["home"]) != self.zona:
+                raise PlanNoValido("el HOME del plan no es el HOME real")
+            self.topes = plan["real"]["topes"]
+        else:
+            for clave in ("home", "tmpdir"):
+                if not bajo(os.path.realpath(plan[clave]), self.zona):
+                    raise PlanNoValido(f"el {clave} del plan no está dentro de la zona sintética")
         if not os.path.exists(plan["config"]) or sha256_fichero(plan["config"]) != plan["config_sha256"]:
             raise PlanNoValido("la configuración del plan no existe o cambió: vuelve a planificar")
         self.cfg = cargar_config(plan["config"], home=plan["home"], tmpdir=plan["tmpdir"])
         self.prot = self.cfg.proteccion
         self.reglas = {r.id: r for r in self.cfg.reglas}
-        self.herramientas = zona_mod.herramientas_de_zona(self.zona)
+        if self.real:
+            try:
+                self.herramientas = autorizacion.herramientas_reales(self.zona)
+            except autorizacion.ErrorAutorizacion as exc:
+                raise PlanNoValido(str(exc)) from exc
+        else:
+            self.herramientas = zona_mod.herramientas_de_zona(self.zona)
         self._raices_regla = {r.id: [os.path.realpath(expandir(x, self.cfg.home, self.cfg.tmpdir)) for x in r.rutas]
                               for r in self.cfg.reglas if r.tipo == "ruta"}
         for r in self.cfg.reglas:
@@ -83,6 +105,12 @@ class Aplicador:
         self.lista_blanca = lista_blanca or listablanca.OFICIAL
         self.subarboles, self.rechazos_lista_blanca = self.lista_blanca.subarboles(self.cfg, self.herramientas)
         self.abiertos = abiertos if abiertos is not None else FicherosAbiertos.capturar()
+        if self.real:
+            self.subarboles = {k: v for k, v in self.subarboles.items() if k == autorizacion.REGLA}
+            try:
+                autorizacion.exigir_condiciones(self.abiertos)
+            except autorizacion.ErrorAutorizacion as exc:
+                raise PlanNoValido(str(exc)) from exc
         self.uid = os.getuid()
         self._renombrar = fsseguro.mover_excl       # punto de inyección para las pruebas de fallos
         self._marcadores_cache: dict[str, str | None] = {}
@@ -174,7 +202,7 @@ class Aplicador:
     def aplicar(self) -> dict:
         qbase = directorio_cuarentena(self.zona)
         op = dt.datetime.fromtimestamp(time.time()).strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(3)
-        os.close(fsseguro.asegurar_dir(self.zona, zona_mod.NOMBRE_CUARENTENA, privado=True))
+        os.close(fsseguro.asegurar_dir(self.zona, os.path.relpath(qbase, self.zona), privado=True))
         self._reservar_plan(qbase, op)
         os.close(fsseguro.asegurar_dir(qbase, op, privado=True))
         qop = os.path.join(qbase, op)
@@ -184,7 +212,8 @@ class Aplicador:
                                plan_huella=self.plan["huella"], zona=self.zona, cuarentena=qop,
                                n_elementos=len(self.plan["elementos"]), ahora=self.ahora,
                                lsof={"disponible": self.abiertos.disponible, "n": len(self.abiertos)},
-                               lista_blanca={"nombre": self.lista_blanca.nombre, "subarboles": self.subarboles})
+                               lista_blanca={"nombre": self.lista_blanca.nombre, "subarboles": self.subarboles},
+                               **({"modo": "real", "autorizacion": autorizacion.ID, "topes": self.topes} if self.real else {}))
         res = {"op": op, "cuarentena": qop, "manifiesto": man.ruta, "movidos": 0, "omitidos": 0, "errores": 0,
                "bytes_movidos": 0, "abortado": None}
         with man.bloquear():
@@ -253,6 +282,11 @@ class Aplicador:
                         man.anotar("omitido", id=e["id"], motivo="la cuarentena está en otro volumen")
                         res["omitidos"] += 1
                         continue
+                    if self.real and (res["movidos"] + 1 > self.topes["ficheros"] or
+                                      res["bytes_movidos"] + st.st_blocks * 512 > self.topes["bytes_fisicos"]):
+                        res["abortado"] = f"se superarían los topes autorizados ({self.topes}) al mover {e['ruta']}"
+                        man.anotar("abortado", motivo=res["abortado"])
+                        break
                     destino = os.path.join(qarch, rel)
                     meta = {k: e[k] for k in ("dev", "ino", "uid", "modo", "tam", "mtime_ns", "ctime_ns", "sha256")}
                     meta["birthtime"] = getattr(st, "st_birthtime", None)

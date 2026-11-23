@@ -277,11 +277,14 @@ class TestOperacionesReales(Base):
         self.addCleanup(shutil.rmtree, sin_marcador, True)
         for z in (os.path.expanduser("~"), sin_marcador, "/private/tmp"):
             with self.subTest(z):
-                with self.assertRaises(zona_mod.ZonaNoValida):
+                # F4B: restore y la recuperación admiten la raíz real (para devolver una limpieza real autorizada);
+                # sin esa operación fallan al leer su manifiesto, sin escribir nada. purge sigue solo en zonas.
+                esperado = ManifiestoCorrupto if zona_mod.es_real(z) else zona_mod.ZonaNoValida
+                with self.assertRaises(esperado):
                     rest.restaurar(z, "20260101-000000-abcdef")
                 with self.assertRaises(zona_mod.ZonaNoValida):
                     purgar(z, dias=14, ejecutar=True)
-                with self.assertRaises(zona_mod.ZonaNoValida):
+                with self.assertRaises(esperado):
                     inventario(z, "20260101-000000-abcdef")
         self.assertFalse(zona_mod.LIMPIEZA_REAL_HABILITADA)
 

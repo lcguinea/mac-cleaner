@@ -76,7 +76,7 @@ class Escaner:
         # F2: si se indica, ninguna raíz puede quedar fuera de este directorio (zona sintética).
         self.limite = os.path.realpath(limite) if limite else None
         self.prot = config.proteccion
-        self.abiertos = abiertos or FicherosAbiertos()
+        self.abiertos = abiertos if abiertos is not None else FicherosAbiertos()
         self.ahora = ahora or time.time()
         self.brew_dry_run = brew_dry_run
         self.herramientas_fijas = herramientas_fijas  # pruebas: {"pip": {"disponible": True, "ruta": ...}}

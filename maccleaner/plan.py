@@ -10,6 +10,11 @@ F3: los planes de zona sintética (y, en el futuro, los reales) llevan además `
 con clave del Llavero (autenticacion.py) que liga versión, id, zona, fechas, configuración y elementos.
 `apply` exige un MAC válido Y además vuelve a comprobar todas las protecciones sin fiarse del plan. Los planes
 sin zona (vista previa o sombra) no se autentican: nunca son aplicables.
+
+F4B (`real=`): plan sobre datos reales SOLO dentro de la autorización de autorizacion.py: escaneo real, ventana,
+lsof disponible, sin pip/npm en ejecución, caché de pip = ~/Library/Caches/pip, lista blanca OFICIAL restringida a
+la regla autorizada, clave NO sintética del Llavero y totales dentro de los topes (que salen de la última sombra);
+si los supera se rechaza entero. Lleva `zona: null` y un bloque `real` firmado con el resto del plan.
 """
 from __future__ import annotations
 
@@ -23,6 +28,7 @@ import secrets
 import time
 
 from . import autenticacion as aut
+from . import autorizacion
 from . import listablanca
 from . import zona as zona_mod
 from .config import Config
@@ -59,10 +65,12 @@ def crear_plan(escaneo: dict, cfg: Config, *, ruta_escaneo: str = "", ahora: flo
                abiertos: FicherosAbiertos | None = None, hash_max_bytes: int = 64 << 20,
                calcular_hash: bool = True, caducidad_h: float = CADUCIDAD_PLAN_H,
                clave: aut.Clave | None = None, firmar: bool = True,
-               lista_blanca: "listablanca.ListaBlanca | None" = None, filtrar: bool = True) -> dict:
+               lista_blanca: "listablanca.ListaBlanca | None" = None, filtrar: bool = True,
+               real: dict | None = None) -> dict:
     """Con zona sintética el plan se firma con `clave` (por defecto, la activa del almacén actual).
     F4A: solo entran elementos de la lista blanca (por defecto la OFICIAL); el resto va a `excluidos` con su motivo.
-    `filtrar=False` solo lo usa la sombra, que clasifica todo para informar (su plan nunca es aplicable)."""
+    `filtrar=False` solo lo usa la sombra, que clasifica todo para informar (su plan nunca es aplicable).
+    F4B: `real={"sombra": doc, "candidatos": lista, "ruta": ruta}` crea un plan real autorizado (ver el docstring)."""
     lb = lista_blanca or listablanca.OFICIAL
     ahora = ahora or time.time()
     t_esc = float(escaneo.get("ahora", 0))
@@ -76,6 +84,28 @@ def crear_plan(escaneo: dict, cfg: Config, *, ruta_escaneo: str = "", ahora: flo
         raise PlanNoValido("la configuración cambió desde el escaneo: vuelve a ejecutar `scan`")
 
     zona = escaneo.get("zona")
+    raiz_real = None
+    if real is not None:
+        if zona:
+            raise PlanNoValido("un plan real necesita un escaneo real, no de una zona sintética")
+        if lista_blanca not in (None, listablanca.OFICIAL) or not filtrar or not firmar:
+            raise PlanNoValido("un plan real solo admite la lista blanca OFICIAL, filtrada y firmada")
+        raiz_real = zona_mod.raiz_real()
+        if os.path.realpath(cfg.home) != raiz_real:
+            raise PlanNoValido("la configuración no es la del HOME real")
+        try:
+            autorizacion.exigir_ventana(ahora)
+            autorizacion.exigir_condiciones(abiertos if abiertos is not None else FicherosAbiertos())
+            herramientas_reales = autorizacion.herramientas_reales(raiz_real)
+        except autorizacion.ErrorAutorizacion as exc:
+            raise PlanNoValido(str(exc)) from exc
+        if clave is None:
+            try:
+                clave = aut.almacen_actual().activa()
+            except aut.ClaveNoDisponible as exc:
+                raise PlanNoValido(f"no se puede firmar el plan: {exc}") from exc
+        if clave.sintetica:
+            raise PlanNoValido("una clave sintética no puede firmar un plan real")
     if zona:
         zona = zona_mod.validar_zona(zona)
         if firmar and clave is None:
@@ -83,9 +113,14 @@ def crear_plan(escaneo: dict, cfg: Config, *, ruta_escaneo: str = "", ahora: flo
                 clave = aut.almacen_actual().activa()
             except aut.ClaveNoDisponible as exc:
                 raise PlanNoValido(f"no se puede firmar el plan: {exc}") from exc
-    esc = Escaner(cfg, abiertos=abiertos or FicherosAbiertos(), ahora=ahora, limite=zona)
-    herramientas = zona_mod.herramientas_de_zona(zona) if zona else listablanca.herramientas_de_escaneo(escaneo["escaneo"]["reglas"])
+    esc = Escaner(cfg, abiertos=abiertos if abiertos is not None else FicherosAbiertos(), ahora=ahora, limite=zona)
+    if raiz_real:
+        herramientas = herramientas_reales
+    else:
+        herramientas = zona_mod.herramientas_de_zona(zona) if zona else listablanca.herramientas_de_escaneo(escaneo["escaneo"]["reglas"])
     subs, rechazos_lb = lb.subarboles(cfg, herramientas)
+    if raiz_real:
+        subs = {k: v for k, v in subs.items() if k == autorizacion.REGLA}   # solo la regla autorizada
     reglas = {r.id: r for r in cfg.reglas}
     elementos, excluidos = [], []
 
@@ -95,6 +130,9 @@ def crear_plan(escaneo: dict, cfg: Config, *, ruta_escaneo: str = "", ahora: flo
             if g.get("recuperable_conservador", 0) <= 0:
                 continue
             base = {"regla": r_esc["id"], "grupo": g["nombre"], "ruta": g["ruta"]}
+            if raiz_real and r_esc["id"] != autorizacion.REGLA:
+                excluidos.append({**base, "motivo": f"regla no autorizada en {autorizacion.ID}"})
+                continue
             if regla is None:
                 excluidos.append({**base, "motivo": "la regla ya no existe en la configuración"})
                 continue
@@ -159,8 +197,24 @@ def crear_plan(escaneo: dict, cfg: Config, *, ruta_escaneo: str = "", ahora: flo
         "elementos": elementos, "excluidos": excluidos[:2000], "n_excluidos": len(excluidos),
         "nota_huella": "SHA-256 de integridad del contenido; no es una firma autenticada.",
     }
+    if raiz_real:
+        try:
+            t = autorizacion.topes_desde_sombra(real.get("sombra"), real.get("candidatos"), subs.get(autorizacion.REGLA, []),
+                                                ahora=ahora, config_sha256=plan["config_sha256"], ruta=real.get("ruta", ""))
+            if not elementos:
+                raise autorizacion.ErrorAutorizacion("no hay nada que limpiar en la caché autorizada")
+            topes = {"ficheros": t["ficheros"], "bytes_fisicos": t["bytes_fisicos"]}
+            if min(topes.values()) <= 0:
+                raise autorizacion.ErrorAutorizacion("la última sombra no tiene nada de pip en la lista blanca: tope 0")
+            autorizacion.comprobar_totales(elementos, topes)
+        except autorizacion.ErrorAutorizacion as exc:
+            raise PlanNoValido(str(exc)) from exc
+        plan["modo"] = f"real ({autorizacion.ID}: solo {autorizacion.REGLA})"
+        plan["real"] = {"raiz": raiz_real, "autorizacion": autorizacion.ID, "regla": autorizacion.REGLA,
+                        "topes": topes, "sombra": t["sombra"],
+                        "ventana": list(autorizacion.VENTANA) if autorizacion.VENTANA else None}
     plan["huella"] = calcular_huella(plan)
-    if zona and firmar:
+    if (zona or raiz_real) and firmar:
         aut.firmar_plan(plan, clave)
     elif not firmar:
         plan["modo"] = "sombra (sin autenticar: no aplicable)"
@@ -220,7 +274,13 @@ def validar_plan(plan: dict, ahora: float | None = None) -> str:
         raise PlanNoValido("«zona» debe ser texto")
     if not _ID_PLAN.fullmatch(plan["id"]):
         raise PlanNoValido("identificador de plan no válido")
-    zona = zona_mod.validar_zona(plan.get("zona"))   # sin zona → limpieza real deshabilitada (primera barrera)
+    if "real" in plan:                               # F4B: solo dentro de la autorización vigente
+        try:
+            zona = autorizacion.validar_plan_real(plan, ahora)
+        except autorizacion.ErrorAutorizacion as exc:
+            raise PlanNoValido(str(exc)) from exc
+    else:
+        zona = zona_mod.validar_zona(plan.get("zona"))   # sin zona → limpieza real deshabilitada (primera barrera)
     try:
         aut.verificar_plan(plan)                     # F3: MAC HMAC-SHA256 con la clave declarada
     except aut.ErrorAutenticacion as exc:
@@ -236,10 +296,17 @@ def validar_plan(plan: dict, ahora: float | None = None) -> str:
             raise PlanNoValido(f"{e['id']}: un plan no puede contener elementos de riesgo alto")
         _validar_tipos(e)
         zona_mod.exigir_dentro(e["ruta"], zona)
+        if "real" in plan and e["regla"] != autorizacion.REGLA:
+            raise PlanNoValido(f"{e['id']}: regla «{e['regla']}» no autorizada en {autorizacion.ID}")
         for conjunto, clave in ((vistos_ruta, e["ruta"]), (vistos_id, e["id"]), (vistos_ino, (e["dev"], e["ino"]))):
             if clave in conjunto:
                 raise PlanNoValido(f"elemento duplicado: {clave}")
             conjunto.add(clave)
+    if "real" in plan:
+        try:
+            autorizacion.comprobar_totales(plan["elementos"], plan["real"]["topes"])
+        except autorizacion.ErrorAutorizacion as exc:
+            raise PlanNoValido(str(exc)) from exc
     return zona
 
 

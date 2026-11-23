@@ -4,6 +4,8 @@ F1 (solo lectura, datos reales): scan, report.
 F2 (reversible, SOLO en zonas sintéticas): plan, apply, restore, purge; además oficiales y demo.
 F3: sombra (evaluación sin mover nada) y clave (HMAC en el Llavero); planes y manifiestos autenticados.
 `plan` también funciona sobre escaneos reales como vista previa, pero `apply` lo rechaza (zona.LIMPIEZA_REAL_HABILITADA = False).
+F4B: `plan --real` crea un plan real SOLO dentro de autorizacion.py (pip, topes de la última sombra, ventana);
+`apply` lo aplica con la cuarentena en ~/.mac-cleaner/cuarentena y `restore --real` lo devuelve. purge sigue sintético.
 """
 from __future__ import annotations
 
@@ -121,7 +123,7 @@ def cmd_report(a: argparse.Namespace) -> int:
 
 def cmd_plan(a: argparse.Namespace) -> int:
     from .plan import PlanNoValido, crear_plan, guardar
-    entrada = a.entrada or _ultimo(SALIDA_DEF)
+    entrada = a.entrada or _ultimo(a.salida or SALIDA_DEF)
     if not entrada:
         print("Falta --entrada (JSON de scan).", file=sys.stderr)
         return 2
@@ -132,18 +134,31 @@ def cmd_plan(a: argparse.Namespace) -> int:
     os.makedirs(salida, exist_ok=True)
     guardia.activar(salida)
     try:
+        real = None
+        if a.real:
+            from . import sombra as sombra_mod
+            ruta_sombra = a.sombra or sombra_mod.ultimo(salida)
+            if not ruta_sombra:
+                raise PlanNoValido("plan --real necesita una sombra reciente: ejecuta `sombra` antes")
+            with open(ruta_sombra, encoding="utf-8") as fh:
+                real = {"sombra": json.load(fh), "candidatos": sombra_mod.cargar_candidatos(ruta_sombra), "ruta": ruta_sombra}
         cfg = _cargar_cfg_zona(escaneo["config"], zona_mod.validar_zona(zona) if zona else None)
         abiertos = sistema.FicherosAbiertos.capturar() if not a.sin_lsof else sistema.FicherosAbiertos()
-        calcular = a.hash if a.hash is not None else bool(zona)   # real: sin hash por defecto (evita leer GB)
+        # real: sin hash por defecto (evita leer GB); F4B (--real) sí, para que restore verifique el contenido.
+        calcular = a.hash if a.hash is not None else bool(zona or a.real)
         plan = crear_plan(escaneo, cfg, ruta_escaneo=entrada, abiertos=abiertos,
-                          hash_max_bytes=cfg.hash_max_bytes, calcular_hash=calcular)
-    except (PlanNoValido, ErrorConfig, zona_mod.ZonaNoValida) as exc:
+                          hash_max_bytes=cfg.hash_max_bytes, calcular_hash=calcular, real=real)
+    except (PlanNoValido, ErrorConfig, zona_mod.ZonaNoValida, OSError, ValueError) as exc:
         print(f"Plan rechazado: {exc}", file=sys.stderr)
         return 2
     ruta = guardar(plan, salida)
     t = plan["totales"]
     print(f"Plan {plan['id']} ({plan['modo']}): {t['elementos']} elementos, {t['bytes_fisicos'] / 1e6:.1f} MB físicos; "
           f"{plan['n_excluidos']} exclusiones. Caduca en 24 h.")
+    if plan.get("real"):
+        tp = plan["real"]["topes"]
+        print(f"Topes ({plan['real']['autorizacion']}): {tp['ficheros']} ficheros, {tp['bytes_fisicos'] / 1e6:.1f} MB "
+              f"(sombra de {plan['real']['sombra']['generado']}).")
     print(f"Plan: {ruta}")
     return 0
 
@@ -154,8 +169,12 @@ def cmd_apply(a: argparse.Namespace) -> int:
     from .plan import PlanNoValido, cargar as cargar_plan
     try:
         plan = cargar_plan(a.plan)
-        zona = zona_mod.validar_zona(plan.get("zona"))
-        guardia.activar(zona)                      # solo se puede escribir dentro de la zona
+        if isinstance(plan, dict) and "real" in plan:
+            # F4B: solo se puede escribir en ~/.mac-cleaner (cuarentena); los movimientos usan renameatx_np y
+            # Aplicador/validar_plan comprueban la autorización completa antes de mover nada.
+            guardia.activar(os.path.join(zona_mod.raiz_real(), zona_mod.DIR_REAL))
+        else:
+            guardia.activar(zona_mod.validar_zona(plan.get("zona")))   # solo se puede escribir dentro de la zona
         res = Aplicador(plan).aplicar()
     except (PlanNoValido, zona_mod.ZonaNoValida, ErrorConfig, DirectorioInseguro) as exc:
         print(f"apply rechazado: {exc}", file=sys.stderr)
@@ -168,8 +187,12 @@ def cmd_restore(a: argparse.Namespace) -> int:
     from .manifiesto import ManifiestoCorrupto, ManifiestoOcupado
     from .restaurar import ErrorRestauracion, inventario_recuperacion, restaurar, restaurar_recuperacion
     try:
-        zona = zona_mod.validar_zona(a.zona)
-        guardia.activar(zona)
+        if a.real:
+            zona = zona_mod.raiz_real()
+            guardia.activar(os.path.join(zona, zona_mod.DIR_REAL))
+        else:
+            zona = zona_mod.validar_zona(a.zona)
+            guardia.activar(zona)
         if not a.recuperacion_sin_clave:
             if a.confirmar or a.codigo:
                 raise ErrorRestauracion("--confirmar y --codigo solo valen con --recuperacion-sin-clave")
@@ -177,7 +200,7 @@ def cmd_restore(a: argparse.Namespace) -> int:
         elif not a.confirmar:
             # Paso 1: inventario de solo lectura. No se mueve nada.
             inv = inventario_recuperacion(zona, a.operacion)
-            salida = os.path.join(zona, "informes")
+            salida = os.path.join(zona_mod.directorio_cuarentena(zona), "informes") if a.real else os.path.join(zona, "informes")
             os.makedirs(salida, exist_ok=True)
             ruta = os.path.join(salida, f"recuperacion-{a.operacion}-{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}.json")
             with open(ruta, "w", encoding="utf-8") as fh:
@@ -386,17 +409,22 @@ def main(argv: list[str] | None = None) -> int:
     pl.add_argument("--entrada", help="JSON de scan (por defecto: el más reciente de informes/)")
     pl.add_argument("--salida", default=None)
     pl.add_argument("--sin-lsof", action="store_true")
+    pl.add_argument("--real", action="store_true",
+                    help=f"F4B: plan real dentro de la autorización escrita (solo pip, topes de la última sombra, ventana)")
+    pl.add_argument("--sombra", help="F4B: sombra que fija los topes (por defecto, la más reciente de la salida)")
     g = pl.add_mutually_exclusive_group()
     g.add_argument("--hash", dest="hash", action="store_true", default=None, help="Calcular SHA-256 (por defecto solo en zona)")
     g.add_argument("--sin-hash", dest="hash", action="store_false")
     pl.set_defaults(func=cmd_plan)
 
-    ap = sub.add_parser("apply", help="Mueve a cuarentena los elementos de un plan (SOLO zonas sintéticas)")
+    ap = sub.add_parser("apply", help="Mueve a cuarentena los elementos de un plan (zona sintética o plan real F4B)")
     ap.add_argument("--plan", required=True)
     ap.set_defaults(func=cmd_apply)
 
-    rs = sub.add_parser("restore", help="Restaura una operación completa o un elemento (SOLO zonas sintéticas)")
-    rs.add_argument("--zona", required=True)
+    rs = sub.add_parser("restore", help="Restaura una operación completa o un elemento (zona sintética o --real)")
+    gz = rs.add_mutually_exclusive_group(required=True)
+    gz.add_argument("--zona")
+    gz.add_argument("--real", action="store_true", help="F4B: operación de la cuarentena real ~/.mac-cleaner/cuarentena")
     rs.add_argument("--operacion", required=True)
     rs.add_argument("--elemento", help="Id del elemento (p. ej. e000003)")
     rs.add_argument("--ruta", help="Ruta original del elemento")

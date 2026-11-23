@@ -20,7 +20,7 @@ _EVENTOS_RUTA = {
 # Posición del argumento dir_fd en los eventos de auditoría que lo admiten (os.remove(path, dir_fd), etc.).
 _POS_DIR_FD = {"os.remove": (1,), "os.rmdir": (1,), "os.mkdir": (2,), "os.chmod": (2,), "os.chown": (3,),
                "os.utime": (3,), "os.rename": (2, 3), "os.replace": (2, 3), "os.link": (2, 3), "os.symlink": (None, 2)}
-EJECUTABLES_PERMITIDOS = {"lsof", "tmutil", "brew", "pip3", "pip"}
+EJECUTABLES_PERMITIDOS = {"lsof", "tmutil", "brew", "pip3", "pip", "ps"}   # ps: F4B, ¿pip o npm en ejecución?
 
 registro: list[str] = []
 _activa = False

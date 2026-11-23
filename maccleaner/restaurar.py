@@ -62,7 +62,7 @@ AVISO_RECUPERACION = ("Manifiesto no autenticado: la clasificación comprueba la
 
 
 def cargar_operacion(zona: str, op: str, sin_clave: bool = False) -> tuple[str, Manifiesto]:
-    zona = zona_mod.validar_zona(zona)
+    zona = zona_mod.validar_ambito(zona)          # F4B: también la raíz real (restore siempre disponible)
     if not op or "/" in op or op.startswith(".") or op == DIR_PLANES:
         raise ErrorRestauracion(f"identificador de operación no válido: {op!r}")
     qop = os.path.join(directorio_cuarentena(zona), op)

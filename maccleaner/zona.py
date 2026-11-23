@@ -9,10 +9,15 @@ Una zona sintética es un directorio de pruebas que cumple TODO esto:
 
 La limpieza de datos reales está deshabilitada por una CONSTANTE del código, no por una opción.
 Habilitarla exige cambiar el código (ver docs/SEGURIDAD-F2.md, «Plan de habilitación»).
+
+F4B: la única excepción es el modo real limitado de `autorizacion.py` (solo pip, con topes y ventana). Su raíz es el
+HOME real canónico (`raiz_real`, que `validar_zona` nunca acepta) y su cuarentena `~/.mac-cleaner/cuarentena`.
+`validar_ambito` admite una zona sintética o esa raíz (la usan apply de un plan real ya validado y restore).
 """
 from __future__ import annotations
 
 import os
+import pwd
 import stat
 import tempfile
 
@@ -21,6 +26,8 @@ LIMPIEZA_REAL_HABILITADA = False
 MARCADOR = ".mac-cleaner-zona-sintetica"
 CONTENIDO_MARCADOR = b"mac-cleaner zona sintetica v1\n"
 NOMBRE_CUARENTENA = ".mac-cleaner-cuarentena"
+DIR_REAL = ".mac-cleaner"                  # ~/.mac-cleaner (guards.PROTECCION_FIJA_RUTAS)
+CUARENTENA_REAL = "cuarentena"
 
 
 class ZonaNoValida(PermissionError):
@@ -85,6 +92,29 @@ def validar_zona(raiz: str | None) -> str:
     return canon
 
 
+def raiz_real() -> str:
+    """HOME real canónico del usuario (de la base de usuarios, no de $HOME). Raíz del modo real F4B."""
+    return os.path.realpath(pwd.getpwuid(os.getuid()).pw_dir)
+
+
+def es_real(raiz) -> bool:
+    return isinstance(raiz, str) and raiz == raiz_real()
+
+
+def validar_ambito(raiz: str | None) -> str:
+    """Zona sintética válida (validar_zona) o exactamente la raíz real. NO autoriza nada por sí misma: crear o aplicar
+    un plan real exige además autorizacion.py; restaurar una operación real no necesita ventana."""
+    if es_real(raiz):
+        return raiz
+    return validar_zona(raiz)
+
+
+def directorio_cuarentena(raiz: str) -> str:
+    if es_real(raiz):
+        return os.path.join(raiz, DIR_REAL, CUARENTENA_REAL)
+    return os.path.join(raiz, NOMBRE_CUARENTENA)
+
+
 def crear_zona(prefijo: str = "mac-cleaner-zona-") -> str:
     """Crea una zona sintética nueva (vacía, con marcador) bajo el directorio temporal del usuario."""
     raiz = os.path.realpath(tempfile.mkdtemp(prefix=prefijo))
@@ -106,7 +136,7 @@ def exigir_dentro(ruta: str, zona: str) -> str:
     rel = norm[len(zona) + 1:]
     if any(c in ("", ".", "..") for c in rel.split("/")):
         raise ZonaNoValida(f"ruta con componentes no válidos: {ruta}")
-    if rel.split("/")[0] in (NOMBRE_CUARENTENA, MARCADOR):
+    if rel.split("/")[0] in (NOMBRE_CUARENTENA, MARCADOR, DIR_REAL):
         raise ZonaNoValida("la ruta apunta a la cuarentena o al marcador de la zona")
     return rel
 
