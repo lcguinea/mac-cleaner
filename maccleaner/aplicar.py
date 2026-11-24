@@ -89,9 +89,13 @@ class Aplicador:
         self.cfg = cargar_config(plan["config"], home=plan["home"], tmpdir=plan["tmpdir"])
         self.prot = self.cfg.proteccion
         self.reglas = {r.id: r for r in self.cfg.reglas}
+        self.abiertos = abiertos if abiertos is not None else FicherosAbiertos.capturar()
+        self.omitidas = {}
         if self.real:
+            # Las condiciones se comprueban OTRA VEZ ahora: solo las reglas del plan que sigan siendo utilizables.
             try:
-                self.herramientas = autorizacion.herramientas_reales(self.zona)
+                self.reglas_aut, self.herramientas, self.omitidas = autorizacion.preparar(
+                    self.zona, self.abiertos, self.ahora, plan["real"]["reglas"])
             except autorizacion.ErrorAutorizacion as exc:
                 raise PlanNoValido(str(exc)) from exc
         else:
@@ -104,13 +108,8 @@ class Aplicador:
                 self._raices_regla[r.id] = [os.path.realpath(info["ruta"])]
         self.lista_blanca = lista_blanca or listablanca.OFICIAL
         self.subarboles, self.rechazos_lista_blanca = self.lista_blanca.subarboles(self.cfg, self.herramientas)
-        self.abiertos = abiertos if abiertos is not None else FicherosAbiertos.capturar()
         if self.real:
-            self.subarboles = {k: v for k, v in self.subarboles.items() if k == autorizacion.REGLA}
-            try:
-                autorizacion.exigir_condiciones(self.abiertos)
-            except autorizacion.ErrorAutorizacion as exc:
-                raise PlanNoValido(str(exc)) from exc
+            self.subarboles = {k: v for k, v in self.subarboles.items() if k in self.reglas_aut}
         self.uid = os.getuid()
         self._renombrar = fsseguro.mover_excl       # punto de inyección para las pruebas de fallos
         self._marcadores_cache: dict[str, str | None] = {}
@@ -165,7 +164,8 @@ class Aplicador:
             return None, f"riesgo alto según la configuración ({motivo})"
         if grupo != e["grupo"]:
             return None, f"el grupo del plan ({e['grupo']}) no coincide con el real ({grupo})"
-        return max(regla.edad_minima_dias, int(e["edad_minima_dias"])), None
+        edad = max(regla.edad_minima_dias, int(e["edad_minima_dias"]))
+        return (autorizacion.edad_minima(regla.id, edad) if self.real else edad), None
 
     # ── comprobación de un elemento ──
     def _verificar(self, e: dict, pfd: int, nombre: str, edad_minima_dias: int) -> tuple[os.stat_result | None, str | None]:

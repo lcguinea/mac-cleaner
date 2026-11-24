@@ -8,13 +8,17 @@ herramienta esperada), ni desde argumentos, ni desde el plan (el campo `lista_bl
 `ListaBlanca` admite otras definiciones solo desde código Python: las pruebas de mecánica genérica de F2 usan una
 lista «de laboratorio» en zonas sintéticas; la CLI y `demo` usan siempre `OFICIAL`.
 
-Alcance: exclusivamente las cachés de contenido regenerables de npm y pip.
+Alcance (F5B amplía el de F3, autorización F5B-app-1 en autorizacion.py):
   * npm  → `<caché de npm>/_cacache` (blobs direccionados por contenido e índice; npm los vuelve a descargar).
            Fuera: `_npx` (paquetes ejecutables, p. ej. herramientas MCP; además protegido en guards/TOML),
            `_logs`, `_prebuilds`, `_tuf`, `_update-notifier-*` y cualquier otro subdirectorio.
   * pip  → `<pip cache dir>/http-v2` y `<pip cache dir>/http` (caché HTTP de descargas).
            Fuera: `wheels` (ruedas compiladas localmente: regenerables, pero recompilarlas puede requerir
            herramientas de compilación), `selfcheck` y cualquier otro subdirectorio.
+  * homebrew → `<brew --cache>/downloads` (descargas y bottles; Homebrew las vuelve a bajar). Fuera: `api/` y el resto.
+  * logs-usuario → `~/Library/Logs` entero (raíz fija, no la decide el TOML), con la antigüedad mínima autorizada.
+  * caches-usuario → `~/Library/Caches` entero (raíz fija), por GRUPOS (primer componente) sin cambios en 30 días;
+           nunca `com.apple.*` ni las cachés que son de otra regla (pip, Homebrew); el riesgo alto lo excluye el plan.
 Nunca: instalaciones (node_modules, site-packages, dist-packages), entornos virtuales, prefijos de Homebrew,
 ni nada bajo un directorio con marcadores de proyecto o entorno. Tampoco órdenes oficiales que borren.
 """
@@ -30,6 +34,13 @@ LISTA_BLANCA = {
             "operacion": "mover a cuarentena (reversible) el contenido de _cacache; npm lo vuelve a descargar"},
     "pip": {"herramienta": "pip", "subdirectorios": ("http-v2", "http"),
             "operacion": "mover a cuarentena (reversible) la caché HTTP de pip; pip la vuelve a descargar"},
+    "homebrew": {"herramienta": "brew", "subdirectorios": ("downloads",),
+                 "operacion": "mover a cuarentena (reversible) descargas de Homebrew con 30 días o más"},
+    "logs-usuario": {"ruta": "~/Library/Logs", "subdirectorios": (".",),
+                     "operacion": "mover a cuarentena (reversible) registros con 30 días o más"},
+    "caches-usuario": {"ruta": "~/Library/Caches", "subdirectorios": (".",),
+                       "excluir_grupos": r"^(com\.apple\.|homebrew$|pip$)",
+                       "operacion": "mover a cuarentena (reversible) cachés de apps sin cambios en 30 días (grupos enteros)"},
 }
 
 # Componentes que nunca pueden aparecer en la ruta de un elemento autorizable ni en la raíz de la caché.
@@ -71,7 +82,7 @@ def subarboles(reglas_escaneo: list[dict], home: str) -> tuple[dict[str, list[st
     for r in reglas_escaneo:
         lb = LISTA_BLANCA.get(r.get("id"))
         info = r.get("herramienta") or {}
-        if not lb or info.get("herramienta") != lb["herramienta"] or not info.get("disponible") or not info.get("ruta"):
+        if not lb or not lb.get("herramienta") or info.get("herramienta") != lb["herramienta"] or not info.get("disponible") or not info.get("ruta"):
             continue
         raiz = os.path.realpath(info["ruta"])
         motivo = motivo_raiz(raiz, home)
@@ -118,6 +129,15 @@ class ListaBlanca:
                 if not info.get("disponible") or not info.get("ruta"):
                     continue
                 raices = [os.path.realpath(info["ruta"])]
+            elif ent.get("ruta"):
+                # Raíz fija de la lista blanca: el TOML no puede cambiarla, solo tenerla entre las rutas de la regla.
+                fija = os.path.realpath(expandir(ent["ruta"], cfg.home, cfg.tmpdir))
+                del_toml = {os.path.realpath(expandir(x, cfg.home, cfg.tmpdir)) for x in r.rutas} if r.tipo == "ruta" else set()
+                if fija not in del_toml:
+                    rechazos.append({"regla": rid, "motivo": f"la regla «{rid}» del TOML no recorre {ent['ruta']}: "
+                                                             "la lista blanca no se aplica"})
+                    continue
+                raices = [fija]
             elif ent.get("rutas"):
                 if r.tipo != "ruta":
                     continue
@@ -141,7 +161,10 @@ class ListaBlanca:
         rel = ruta[len(sub):].strip("/").split("/")
         if any(COMPONENTES_PROHIBIDOS.match(c) for c in rel):
             return False, "la ruta contiene un componente de instalación o entorno"
-        return True, f"{regla}: {os.path.basename(sub)}"
+        excluir = self.entradas[regla].get("excluir_grupos")
+        if excluir and re.search(excluir, rel[0], re.IGNORECASE):
+            return False, f"grupo excluido de {regla} ({rel[0]})"
+        return True, f"{regla}: {rel[0] if self.entradas[regla]['subdirectorios'] == ('.',) else os.path.basename(sub)}"
 
     def raiz_sigue_aceptable(self, ruta: str, subs: dict[str, list[str]], regla: str, home: str) -> str | None:
         """Revalidación inmediatamente anterior al movimiento: la raíz de la caché sigue sin marcadores de proyecto
@@ -156,7 +179,8 @@ class ListaBlanca:
                 return "el subárbol de la lista blanca ya no es un directorio real"
         except OSError as exc:
             return f"no se puede comprobar el subárbol: {exc}"
-        return motivo_raiz(os.path.dirname(sub), home)
+        entera = self.entradas.get(regla, {}).get("subdirectorios") == (".",)
+        return motivo_raiz(sub if entera else os.path.dirname(sub), home)
 
 
 OFICIAL = ListaBlanca(LISTA_BLANCA, "oficial")

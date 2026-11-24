@@ -485,7 +485,7 @@ class TestListaBlancaYSombra(ZonaHerramientas):
         t = d["candidatos"]["totales"]
         self.assertEqual(t["lista_blanca_ficheros"], 4)            # solo los 4 permitidos
         ops = {o["regla"]: o for o in d["operaciones_que_requieren_autorizacion"] if o["en_lista_blanca"]}
-        self.assertEqual(set(ops), {"npm", "pip"})
+        self.assertEqual({r for r, o in ops.items() if o["ficheros"]}, {"npm", "pip"})   # F5B lista más reglas (vacías)
         self.assertFalse(d["limpieza_real_habilitada"])
 
     def test_nada_de_node_modules_ni_entornos_aunque_esten_en_cacache(self):

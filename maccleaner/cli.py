@@ -232,6 +232,13 @@ def cmd_restore(a: argparse.Namespace) -> int:
 def cmd_purge(a: argparse.Namespace) -> int:
     from .purgar import purgar
     try:
+        if a.real:
+            from . import autorizacion as au
+            guardia.activar(os.path.join(zona_mod.raiz_real(), zona_mod.DIR_REAL))
+            dias = a.dias if a.dias is not None else au.DIAS_CUARENTENA
+            res = purgar(None, dias=dias, ejecutar=a.ejecutar, real=True)
+            print(json.dumps(res, ensure_ascii=False, indent=1))
+            return 0 if not res.get("errores") else 1
         zona = zona_mod.validar_zona(a.zona)
         guardia.activar(zona)
         cfg_dias = a.dias if a.dias is not None else cargar(a.config).dias_cuarentena
@@ -366,6 +373,49 @@ def cmd_observacion(a: argparse.Namespace) -> int:
     return 0
 
 
+def estado_autorizacion(ahora: float | None = None) -> dict:
+    """F5A: estado de la autorización de limpieza real, tal como está en el código (solo lectura)."""
+    import time
+    from . import autorizacion as au
+    return au.estado(time.time() if ahora is None else ahora)
+
+
+def cmd_limpiar(a: argparse.Namespace) -> int:
+    """F5B: limpieza real autorizada para la app. --vista-previa (solo lectura) o --ejecutar --hasta-bytes N."""
+    import time
+    from . import autorizacion as au, limpieza
+    from .fsseguro import DirectorioInseguro
+    from .plan import PlanNoValido
+    raiz = zona_mod.raiz_real()
+    base = os.path.join(raiz, zona_mod.DIR_REAL)
+    salida = limpieza.directorio_informes(raiz)
+    os.makedirs(salida, mode=0o700, exist_ok=True)
+    os.chmod(base, 0o700)
+    guardia.activar(base)                       # solo se puede escribir en ~/.mac-cleaner
+    try:
+        cfg = cargar(a.config)
+        ahora = time.time()
+        if a.vista_previa:
+            abiertos = sistema.FicherosAbiertos.capturar()
+            res = limpieza.vista_previa(cfg, abiertos=abiertos, ahora=ahora, salida=salida)
+        else:
+            if not a.hasta_bytes or a.hasta_bytes <= 0:
+                raise ValueError("--ejecutar necesita --hasta-bytes (lo que el usuario confirmó)")
+            res = limpieza.ejecutar(cfg, hasta_bytes=a.hasta_bytes, reglas=a.regla, ahora=ahora, salida=salida)
+    except (PlanNoValido, au.ErrorAutorizacion, ErrorConfig, zona_mod.ZonaNoValida, DirectorioInseguro,
+            OSError, ValueError) as exc:
+        print(f"Limpieza rechazada: {exc}", file=sys.stderr)
+        return 2
+    print(json.dumps(res, ensure_ascii=False, indent=1))
+    return 0 if not res.get("abortado") and not res.get("errores") else 1
+
+
+def cmd_autorizacion(a: argparse.Namespace) -> int:
+    """F5A: imprime en JSON qué limpieza real autoriza el código ahora. No escribe nada."""
+    print(json.dumps(estado_autorizacion(), ensure_ascii=False, indent=1))
+    return 0
+
+
 def cmd_clave(a: argparse.Namespace) -> int:
     """Gestión de la clave HMAC. crear/rotar escriben SOLO en el Llavero y solo con orden expresa del usuario."""
     from . import autenticacion as aut
@@ -435,11 +485,13 @@ def main(argv: list[str] | None = None) -> int:
     rs.add_argument("--codigo", help="Código impreso con el inventario")
     rs.set_defaults(func=cmd_restore)
 
-    pu = sub.add_parser("purge", help="Lista (o, con --ejecutar, borra en zona sintética) lo caducado en cuarentena")
-    pu.add_argument("--zona", required=True)
+    pu = sub.add_parser("purge", help="Lista (o, con --ejecutar, borra) lo caducado en cuarentena (zona sintética o --real)")
+    gp = pu.add_mutually_exclusive_group(required=True)
+    gp.add_argument("--zona")
+    gp.add_argument("--real", action="store_true", help="F5B: cuarentena real (≥ 14 días, autorización F5B-app-1)")
     pu.add_argument("--dias", type=float, default=None, help="Retención en días (por defecto [cuarentena].dias = 14)")
     pu.add_argument("--config", default=CONFIG_DEF)
-    pu.add_argument("--ejecutar", action="store_true", help="Borrar de verdad (solo zonas sintéticas)")
+    pu.add_argument("--ejecutar", action="store_true", help="Borrar de verdad (lo seleccionado)")
     pu.set_defaults(func=cmd_purge)
 
     of = sub.add_parser("oficiales", help="Operaciones de brew, npm y pip: reversibles frente a destructivas")
@@ -466,6 +518,18 @@ def main(argv: list[str] | None = None) -> int:
     cl = sub.add_parser("clave", help="F3: clave HMAC en el Llavero (estado | crear | rotar)")
     cl.add_argument("accion", choices=("estado", "crear", "rotar"))
     cl.set_defaults(func=cmd_clave)
+
+    li = sub.add_parser("limpiar", help="F5B: limpieza real autorizada (vista previa o ejecución), para la app")
+    gl = li.add_mutually_exclusive_group(required=True)
+    gl.add_argument("--vista-previa", action="store_true", help="Escaneo y sombra: qué entraría (no mueve nada)")
+    gl.add_argument("--ejecutar", action="store_true", help="Escaneo, sombra, plan real y apply en un solo proceso")
+    li.add_argument("--hasta-bytes", type=int, help="Tope confirmado por el usuario (bytes físicos)")
+    li.add_argument("--regla", action="append", help="Limitar a estas categorías autorizadas (repetible)")
+    li.add_argument("--config", default=CONFIG_DEF)
+    li.set_defaults(func=cmd_limpiar)
+
+    au = sub.add_parser("autorizacion", help="F5A: qué limpieza real autoriza el código ahora (JSON, solo lectura)")
+    au.set_defaults(func=cmd_autorizacion)
 
     a = p.parse_args(argv)
     return a.func(a)

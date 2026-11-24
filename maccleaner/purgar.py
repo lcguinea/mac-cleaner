@@ -16,6 +16,10 @@ F2.5:
     un directorio intermedio por un enlace entre la comprobación y el borrado ya no desvía el borrado;
   * los directorios vacíos se retiran con fwalk + rmdirat, sin seguir enlaces.
 
+F5B: purga REAL (`real=True`, raíz = HOME real, cuarentena ~/.mac-cleaner/cuarentena) solo si autorizacion.PURGA_REAL,
+con una retención de al menos autorizacion.DIAS_CUARENTENA días y solo de operaciones reales de una autorización
+conocida (vigente o anterior). Se vuelve a comprobar todo inmediatamente antes de borrar.
+
 F3: solo se seleccionan y purgan operaciones cuyo manifiesto tiene MAC válidos con su clave. Sin la clave
 (o con un manifiesto F2 sin autenticar) la operación se descarta; nunca se borra nada «en recuperación».
 """
@@ -25,7 +29,7 @@ import os
 import stat
 import time
 
-from . import fsseguro, zona as zona_mod
+from . import autorizacion, fsseguro, zona as zona_mod
 from .aplicar import DIR_ARCHIVOS, DIR_PLANES, directorio_cuarentena
 from .manifiesto import Manifiesto, ManifiestoCorrupto, ManifiestoOcupado
 
@@ -34,10 +38,21 @@ DIAS_POR_DEFECTO = 14
 DIAS_MINIMOS = 1
 
 
-def seleccionar(zona: str, *, dias: float = DIAS_POR_DEFECTO, ahora: float | None = None) -> dict:
+def _ambito(zona: str | None, real: bool, dias) -> str:
+    """Zona sintética, o la raíz real si la purga real está autorizada y la retención no baja de la autorizada."""
+    if not real:
+        return zona_mod.validar_zona(zona)
+    if not autorizacion.PURGA_REAL:
+        raise zona_mod.ZonaNoValida(f"la purga real no está autorizada ({autorizacion.ID})")
+    if dias < autorizacion.DIAS_CUARENTENA:
+        raise ValueError(f"la purga real exige al menos {autorizacion.DIAS_CUARENTENA} días en cuarentena")
+    return zona_mod.raiz_real()
+
+
+def seleccionar(zona: str | None, *, dias: float = DIAS_POR_DEFECTO, ahora: float | None = None, real: bool = False) -> dict:
     if not isinstance(dias, (int, float)) or isinstance(dias, bool) or not dias >= DIAS_MINIMOS:
         raise ValueError(f"la retención debe ser de al menos {DIAS_MINIMOS} día (recibido: {dias!r})")
-    zona = zona_mod.validar_zona(zona)
+    zona = _ambito(zona, real, dias)
     ahora = ahora or time.time()
     qbase = directorio_cuarentena(zona)
     ops, descartadas = [], []
@@ -64,6 +79,10 @@ def seleccionar(zona: str, *, dias: float = DIAS_POR_DEFECTO, ahora: float | Non
         if not man.cerrado:
             descartadas.append({"op": op, "motivo": "operación sin cierre (incompleta): no se purga"})
             continue
+        if real and (man.inicio.get("modo") != "real" or man.inicio.get("autorizacion") not in autorizacion.ids_conocidos()
+                     or man.inicio.get("zona") != zona or man.inicio.get("cuarentena") != qop):
+            descartadas.append({"op": op, "motivo": "no es una operación real de una autorización conocida"})
+            continue
         edad = (ahora - man.inicio["t"]) / DIA
         pendientes = [e for e in man.estados().values() if e.get("estado") == "movido"]
         if edad < dias:
@@ -76,16 +95,17 @@ def seleccionar(zona: str, *, dias: float = DIAS_POR_DEFECTO, ahora: float | Non
         ops.append({"op": op, "edad_dias": round(edad, 2), "elementos": [
             {"id": e["id"], "origen": e["origen"], "destino": e["destino"], "ino": e["meta"]["ino"], "tam": e["meta"]["tam"]}
             for e in pendientes]})
-    return {"zona": zona, "dias": dias, "seleccionadas": ops, "descartadas": descartadas,
+    return {"zona": zona, "real": real, "dias": dias, "seleccionadas": ops, "descartadas": descartadas,
             "bytes": sum(x["tam"] for o in ops for x in o["elementos"])}
 
 
-def purgar(zona: str, *, dias: float = DIAS_POR_DEFECTO, ahora: float | None = None, ejecutar: bool = False) -> dict:
-    sel = seleccionar(zona, dias=dias, ahora=ahora)
+def purgar(zona: str | None, *, dias: float = DIAS_POR_DEFECTO, ahora: float | None = None, ejecutar: bool = False,
+           real: bool = False) -> dict:
+    sel = seleccionar(zona, dias=dias, ahora=ahora, real=real)
     sel["ejecutado"] = False
     if not ejecutar:
         return sel
-    zona = zona_mod.validar_zona(sel["zona"])   # vuelve a validar inmediatamente antes de borrar
+    zona = _ambito(sel["zona"], real, dias)   # vuelve a validar inmediatamente antes de borrar
     borrados = errores = saltados = 0
     ocupadas = []
     for o in sel["seleccionadas"]:

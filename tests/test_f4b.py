@@ -55,6 +55,12 @@ edad_minima_dias = 0
 """
 
 
+def _config_f4b():
+    return [mock.patch.object(autorizacion, k, v) for k, v in {
+        "ID": "F4B-pip-1", "REGLAS": ("pip",), "MAX_BYTES": 1_500_000_000, "REQUIERE_VENTANA": True,
+        "PURGA_REAL": False, "EDAD_MINIMA_DIAS": {}}.items()]
+
+
 def _iso(t: float) -> str:
     return dt.datetime.fromtimestamp(t).isoformat(timespec="seconds")
 
@@ -88,7 +94,9 @@ class Real(unittest.TestCase):
         for p in (mock.patch.object(zona_mod, "raiz_real", lambda: self.home),
                   mock.patch.object(autorizacion, "localizar_pip", lambda home: dict(self.info_pip)),
                   mock.patch.object(autorizacion, "procesos_en_conflicto", lambda: []),
-                  mock.patch.object(autorizacion, "VENTANA", (_iso(self.T0 - 3600), _iso(self.T0 + 3600)))):
+                  mock.patch.object(autorizacion, "VENTANA", (_iso(self.T0 - 3600), _iso(self.T0 + 3600))),
+                  # F5B generalizó la autorización: estas pruebas fijan la de F4B (solo pip, con ventana, sin purga).
+                  *_config_f4b()):
             p.start()
             self.addCleanup(p.stop)
 
@@ -146,7 +154,7 @@ class TestCicloReal(Real):
         plan = self.planificar()
         self.assertIsNone(plan["zona"])
         self.assertEqual({e["ruta"] for e in plan["elementos"]}, set(self.permitidos))
-        self.assertEqual(plan["real"]["regla"], "pip")
+        self.assertEqual(plan["real"]["reglas"], ["pip"])
         self.assertEqual(plan["real"]["topes"]["ficheros"], 2)
         self.assertEqual(plan["real"]["topes"]["bytes_fisicos"], plan["totales"]["bytes_fisicos"])
         self.assertTrue(all(e["sha256"] for e in plan["elementos"]))
@@ -401,7 +409,8 @@ class TestTopes(Real):
 class TestPorDefecto(unittest.TestCase):
     def test_la_limpieza_real_general_sigue_deshabilitada(self):
         self.assertFalse(zona_mod.LIMPIEZA_REAL_HABILITADA)
-        self.assertEqual((autorizacion.REGLA, autorizacion.MAX_BYTES), ("pip", 1_500_000_000))
+        f4b = autorizacion.ANTERIORES["F4B-pip-1"]                 # F5B la sustituyó; queda en el historial
+        self.assertEqual((f4b["reglas"], f4b["max_bytes"]), (["pip"], 1_500_000_000))
 
     def test_raiz_real_es_el_home_del_usuario_y_no_una_zona(self):
         raiz = zona_mod.raiz_real()

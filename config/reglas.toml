@@ -38,6 +38,7 @@ nombres = [
   'aeon',
   '(ollama|lm.?studio|huggingface|gguf|diffusers|comfyui)',
   '(ableton|logic ?pro|^logic$|com\.apple\.(logic|garageband|mainstage)|pro ?tools|^avid$|soundflow|splice|native ?instruments|kontakt|izotope|spitfire|waves|arturia|universal ?audio|melodyne|celemony|fabfilter|steinberg|cubase|serato|rekordbox)',
+  '(ilok|paceap|^eden$|spectrasonics|omnisphere|keyscape|trilian|rogue ?amoeba|loopback)',   # licencias (iLok/PACE) y audio
   '(remotion|davinci|resolve|final ?cut|premiere|after ?effects|blender|cinema ?4d|redshift|octane|render)',
   '(keychain|1password|bitwarden|lastpass|gnupg|credential|secret|wallet|\.ssh$|\.aws$|\.kube$)',
 ]

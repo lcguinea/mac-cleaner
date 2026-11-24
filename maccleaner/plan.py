@@ -11,9 +11,9 @@ con clave del Llavero (autenticacion.py) que liga versión, id, zona, fechas, co
 `apply` exige un MAC válido Y además vuelve a comprobar todas las protecciones sin fiarse del plan. Los planes
 sin zona (vista previa o sombra) no se autentican: nunca son aplicables.
 
-F4B (`real=`): plan sobre datos reales SOLO dentro de la autorización de autorizacion.py: escaneo real, ventana,
-lsof disponible, sin pip/npm en ejecución, caché de pip = ~/Library/Caches/pip, lista blanca OFICIAL restringida a
-la regla autorizada, clave NO sintética del Llavero y totales dentro de los topes (que salen de la última sombra);
+F4B/F5B (`real=`): plan sobre datos reales SOLO dentro de la autorización de autorizacion.py: escaneo real, ventana
+(si la exige), lsof disponible, cachés de las herramientas donde se esperan (una herramienta en ejecución omite su
+categoría), antigüedad mínima autorizada, lista blanca OFICIAL restringida a las reglas autorizadas, clave NO sintética del Llavero y totales dentro de los topes (que salen de la última sombra);
 si los supera se rechaza entero. Lleva `zona: null` y un bloque `real` firmado con el resto del plan.
 """
 from __future__ import annotations
@@ -94,9 +94,8 @@ def crear_plan(escaneo: dict, cfg: Config, *, ruta_escaneo: str = "", ahora: flo
         if os.path.realpath(cfg.home) != raiz_real:
             raise PlanNoValido("la configuración no es la del HOME real")
         try:
-            autorizacion.exigir_ventana(ahora)
-            autorizacion.exigir_condiciones(abiertos if abiertos is not None else FicherosAbiertos())
-            herramientas_reales = autorizacion.herramientas_reales(raiz_real)
+            reglas_aut, herramientas_reales, omitidas = autorizacion.preparar(
+                raiz_real, abiertos if abiertos is not None else FicherosAbiertos(), ahora, real.get("reglas"))
         except autorizacion.ErrorAutorizacion as exc:
             raise PlanNoValido(str(exc)) from exc
         if clave is None:
@@ -120,7 +119,8 @@ def crear_plan(escaneo: dict, cfg: Config, *, ruta_escaneo: str = "", ahora: flo
         herramientas = zona_mod.herramientas_de_zona(zona) if zona else listablanca.herramientas_de_escaneo(escaneo["escaneo"]["reglas"])
     subs, rechazos_lb = lb.subarboles(cfg, herramientas)
     if raiz_real:
-        subs = {k: v for k, v in subs.items() if k == autorizacion.REGLA}   # solo la regla autorizada
+        subs_todas = dict(subs)                                     # para atribuir cada candidato a su regla
+        subs = {k: v for k, v in subs.items() if k in reglas_aut}   # solo las reglas autorizadas y utilizables
     reglas = {r.id: r for r in cfg.reglas}
     elementos, excluidos = [], []
 
@@ -130,8 +130,9 @@ def crear_plan(escaneo: dict, cfg: Config, *, ruta_escaneo: str = "", ahora: flo
             if g.get("recuperable_conservador", 0) <= 0:
                 continue
             base = {"regla": r_esc["id"], "grupo": g["nombre"], "ruta": g["ruta"]}
-            if raiz_real and r_esc["id"] != autorizacion.REGLA:
-                excluidos.append({**base, "motivo": f"regla no autorizada en {autorizacion.ID}"})
+            if raiz_real and r_esc["id"] not in reglas_aut:
+                motivo = omitidas.get(r_esc["id"]) or f"regla no autorizada en {autorizacion.ID}"
+                excluidos.append({**base, "motivo": motivo})
                 continue
             if regla is None:
                 excluidos.append({**base, "motivo": "la regla ya no existe en la configuración"})
@@ -149,7 +150,8 @@ def crear_plan(escaneo: dict, cfg: Config, *, ruta_escaneo: str = "", ahora: flo
             if not ficheros:
                 excluidos.append({**base, "motivo": "vacío ahora"})
                 continue
-            edad_min = regla.edad_minima_dias * DIA
+            edad_dias = autorizacion.edad_minima(regla.id, regla.edad_minima_dias) if raiz_real else regla.edad_minima_dias
+            edad_min = edad_dias * DIA
             if esc.abiertos.alguno_bajo(g["ruta"]) or any(esc.abiertos.abierto(p) for p, _ in ficheros):
                 excluidos.append({**base, "motivo": "en uso ahora (ficheros abiertos)"})
                 continue
@@ -178,7 +180,7 @@ def crear_plan(escaneo: dict, cfg: Config, *, ruta_escaneo: str = "", ahora: flo
                     "ruta": ruta, "dev": st.st_dev, "ino": st.st_ino, "uid": st.st_uid, "modo": st.st_mode,
                     "tam": st.st_size, "bloques": st.st_blocks, "mtime_ns": st.st_mtime_ns,
                     "ctime_ns": st.st_ctime_ns, "birthtime": getattr(st, "st_birthtime", None),
-                    "sha256": sha, "edad_minima_dias": regla.edad_minima_dias,
+                    "sha256": sha, "edad_minima_dias": edad_dias,
                     "lista_blanca": motivo_lb if ok_lb else None,
                 })
 
@@ -199,20 +201,22 @@ def crear_plan(escaneo: dict, cfg: Config, *, ruta_escaneo: str = "", ahora: flo
     }
     if raiz_real:
         try:
-            t = autorizacion.topes_desde_sombra(real.get("sombra"), real.get("candidatos"), subs.get(autorizacion.REGLA, []),
-                                                ahora=ahora, config_sha256=plan["config_sha256"], ruta=real.get("ruta", ""))
+            t = autorizacion.topes_desde_sombra(real.get("sombra"), real.get("candidatos"), subs_todas,
+                                                ahora=ahora, config_sha256=plan["config_sha256"], ruta=real.get("ruta", ""),
+                                                hasta_bytes=real.get("hasta_bytes"), reglas=list(reglas_aut))
             if not elementos:
-                raise autorizacion.ErrorAutorizacion("no hay nada que limpiar en la caché autorizada")
+                raise autorizacion.ErrorAutorizacion("no hay nada que limpiar en las categorías autorizadas")
             topes = {"ficheros": t["ficheros"], "bytes_fisicos": t["bytes_fisicos"]}
             if min(topes.values()) <= 0:
-                raise autorizacion.ErrorAutorizacion("la última sombra no tiene nada de pip en la lista blanca: tope 0")
+                raise autorizacion.ErrorAutorizacion("la última sombra no tiene nada autorizado en la lista blanca: tope 0")
             autorizacion.comprobar_totales(elementos, topes)
         except autorizacion.ErrorAutorizacion as exc:
             raise PlanNoValido(str(exc)) from exc
-        plan["modo"] = f"real ({autorizacion.ID}: solo {autorizacion.REGLA})"
-        plan["real"] = {"raiz": raiz_real, "autorizacion": autorizacion.ID, "regla": autorizacion.REGLA,
+        plan["modo"] = f"real ({autorizacion.ID}: {', '.join(reglas_aut)})"
+        plan["real"] = {"raiz": raiz_real, "autorizacion": autorizacion.ID, "reglas": list(reglas_aut),
                         "topes": topes, "sombra": t["sombra"],
-                        "ventana": list(autorizacion.VENTANA) if autorizacion.VENTANA else None}
+                        "ventana": list(autorizacion.VENTANA) if autorizacion.REQUIERE_VENTANA and autorizacion.VENTANA else None}
+        plan["omitidas"] = omitidas
     plan["huella"] = calcular_huella(plan)
     if (zona or raiz_real) and firmar:
         aut.firmar_plan(plan, clave)
@@ -296,7 +300,7 @@ def validar_plan(plan: dict, ahora: float | None = None) -> str:
             raise PlanNoValido(f"{e['id']}: un plan no puede contener elementos de riesgo alto")
         _validar_tipos(e)
         zona_mod.exigir_dentro(e["ruta"], zona)
-        if "real" in plan and e["regla"] != autorizacion.REGLA:
+        if "real" in plan and e["regla"] not in plan["real"]["reglas"]:
             raise PlanNoValido(f"{e['id']}: regla «{e['regla']}» no autorizada en {autorizacion.ID}")
         for conjunto, clave in ((vistos_ruta, e["ruta"]), (vistos_id, e["id"]), (vistos_ino, (e["dev"], e["ino"]))):
             if clave in conjunto:

@@ -7,3 +7,6 @@ docs/ESTADO-MAC-*.md
 .DS_Store
 __pycache__/
 *.pyc
+# App de macOS: compilación y paquete
+app/.build/
+app/dist/

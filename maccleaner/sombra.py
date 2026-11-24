@@ -21,6 +21,7 @@ import glob
 import hashlib
 import json
 import os
+import re
 import time
 
 from . import listablanca, zona as zona_mod
@@ -31,7 +32,9 @@ from .sistema import FicherosAbiertos
 
 VERSION_SOMBRA = 2
 MUESTRA = 5
-GRUPOS_ESPERADOS = {"npm:_cacache", "pip:http-v2", "pip:http"}
+GRUPOS_ESPERADOS = {"npm:_cacache", "pip:http-v2", "pip:http", "homebrew:downloads"}
+# F5B: en estas reglas cualquier grupo puede entrar (raíz entera), salvo los excluidos por la lista blanca.
+REGLAS_RAIZ_ENTERA = {r for r, e in listablanca.LISTA_BLANCA.items() if e["subdirectorios"] == (".",)}
 _VOLATILES = ("generado", "ahora", "cambios", "guardia", "huella_informe", "observacion")
 
 
@@ -144,8 +147,15 @@ def evaluar(escaneo: dict, cfg: Config, *, abiertos: FicherosAbiertos, ahora: fl
 
     lb_grupos = [f"{g['regla']}:{g['grupo']}" for g in orden if g["lista_blanca"]["si"]]
     prot = cfg.proteccion
+    excluidos_lb = {}
+    for g in orden:
+        patron = listablanca.LISTA_BLANCA.get(g["regla"], {}).get("excluir_grupos")
+        if g["lista_blanca"]["si"] and patron and re.search(patron, g["grupo"], re.IGNORECASE):
+            excluidos_lb[f"{g['regla']}:{g['grupo']}"] = g["lista_blanca"]["si"]
     verificaciones = {
-        "grupos_lista_blanca_inesperados": sorted(set(lb_grupos) - GRUPOS_ESPERADOS),
+        "grupos_lista_blanca_inesperados": sorted(k for k in set(lb_grupos) - GRUPOS_ESPERADOS
+                                                  if k.split(":", 1)[0] not in REGLAS_RAIZ_ENTERA),
+        "grupos_excluidos_admitidos": sorted(excluidos_lb),
         "candidatos_con_proteccion": [r for r, *_ in lista if prot.motivo_ruta(r) or prot.motivo_nombre(os.path.basename(r), False)][:20],
         "candidatos_con_componente_prohibido": [r for r, *_ in lista if any(
             listablanca.COMPONENTES_PROHIBIDOS.match(c) for c in r.split("/"))][:20],
@@ -153,7 +163,7 @@ def evaluar(escaneo: dict, cfg: Config, *, abiertos: FicherosAbiertos, ahora: fl
         "limpieza_real_habilitada": zona_mod.LIMPIEZA_REAL_HABILITADA,
     }
     verificaciones["bloqueantes"] = sum(len(verificaciones[k]) for k in (
-        "grupos_lista_blanca_inesperados", "candidatos_con_proteccion", "candidatos_con_componente_prohibido",
+        "grupos_lista_blanca_inesperados", "grupos_excluidos_admitidos", "candidatos_con_proteccion", "candidatos_con_componente_prohibido",
         "rechazos_raiz")) + int(verificaciones["limpieza_real_habilitada"])
 
     operaciones = []
@@ -163,11 +173,9 @@ def evaluar(escaneo: dict, cfg: Config, *, abiertos: FicherosAbiertos, ahora: fl
             "regla": rid, "operacion": ent["operacion"], "en_lista_blanca": True,
             "ficheros": sum(g["lista_blanca"]["si"] for g in gs),
             "bytes_fisicos": sum(g["lista_blanca"]["bytes_si"] for g in gs),
-            "requiere": ["7 observaciones en sombra en 7 días distintos sin verificaciones bloqueantes (docs/F4.md)",
-                         "autorización escrita de F4B para esta regla, con tope de ficheros y de bytes",
-                         "clave HMAC en el Llavero (`mac-cleaner clave crear`) y confirmación en el diálogo",
-                         "cambio de código revisado de F4B (hoy LIMPIEZA_REAL_HABILITADA = False)",
-                         "restauración de prueba completa antes de la limpieza definitiva"],
+            "requiere": ["regla en autorizacion.REGLAS (autorización escrita vigente)",
+                         "clave HMAC en el Llavero y confirmación en el diálogo de macOS",
+                         "confirmación del usuario en la app (tope de bytes que vio)"],
         })
     fuera: dict[str, dict] = {}
     for g in orden:
@@ -312,7 +320,8 @@ def markdown(d: dict) -> str:
     for m, n in sorted(d["exclusiones"]["escaneo"].items(), key=lambda x: (-x[1], x[0]))[:30]:
         w(f"- (escaneo) {m}: {n}")
     w("\n## Verificaciones automáticas (falsos positivos)\n")
-    for k in ("grupos_lista_blanca_inesperados", "candidatos_con_proteccion", "candidatos_con_componente_prohibido", "rechazos_raiz"):
+    for k in ("grupos_lista_blanca_inesperados", "grupos_excluidos_admitidos", "candidatos_con_proteccion",
+              "candidatos_con_componente_prohibido", "rechazos_raiz"):
         w(f"- {k}: {len(v[k])}" + (f" → {v[k][:5]}" if v[k] else ""))
     w("\n## Riesgos\n")
     for r in d["riesgos"]:

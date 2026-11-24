@@ -14,6 +14,13 @@ la limpieza real **sigue deshabilitada** (F4B no habilitada; procedimiento en `d
   **zonas sintéticas** (directorios temporales de prueba con marcador): la limpieza de datos reales está
   deshabilitada en el código (`zona.LIMPIEZA_REAL_HABILITADA = False`). Ver `docs/SEGURIDAD-F2.md`.
 
+## App de macOS (F5A/F5B)
+
+`app/empaquetar.sh --instalar` compila la app nativa (SwiftUI, sin Xcode) e instala `Mac Cleaner.app` en
+`~/Applications`: escaneo rápido, archivos grandes (a la Papelera, uno a uno), memoria (apps, salir, `purge`) y
+cuarentena (restaurar y purgar). Lleva el motor dentro. F5B: limpieza real desde la app de pip, npm, descargas de
+Homebrew, registros y cachés de apps, con la autorización escrita `F5B-app-1` (ver `docs/F5.md`).
+
 ## Uso
 
 ```bash
